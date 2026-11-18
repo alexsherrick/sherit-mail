@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Sherit" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/page_bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31" xmlns:tools="http://schemas.android.com/tools">@color/page_bg</item>
+    </style>
+    <!-- The hand-off screen (OpenActivity): the page's own background, with no icon on its startup screen. -->
+    <style name="Theme.Sherit.Open" parent="Theme.Sherit">
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31" xmlns:tools="http://schemas.android.com/tools">@android:color/transparent</item>
+    </style>
+</resources>

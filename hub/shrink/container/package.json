@@ -1,0 +1,9 @@
+{
+  "name": "mailhub-shrinker",
+  "private": true,
+  "type": "module",
+  "description": "sharp behind one HTTP route, run in the mailhub-shrink container",
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}

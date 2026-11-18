@@ -1,0 +1,49 @@
+{
+  "name": "mailhub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test:smoke": "node test/smoke.cjs",
+    "test:back": "python3 test/back.py",
+    "test:launch": "python3 test/launch.py",
+    "test:deferred": "node test/deferred.mjs",
+    "test:claim": "node test/claim.mjs",
+    "test:delta": "node test/delta.mjs",
+    "test:unsub": "node test/unsub.mjs",
+    "test:imapacct": "node test/imapacct.mjs",
+    "test:imapsync": "node test/imapsync.mjs",
+    "test:attname": "node test/attname.mjs",
+    "test:trust": "node test/trust.mjs",
+    "test:snippet": "python3 test/snippet.py",
+    "test:maildark": "python3 test/maildark.py",
+    "test:accounts": "python3 test/accounts.py",
+    "test:domainage": "node test/domainage.mjs",
+    "test:ingest": "node test/ingest.mjs",
+    "test:inline": "python3 test/inline.py",
+    "test:fts": "node test/fts.mjs",
+    "test:budget": "node test/budget.mjs",
+    "test:push": "node test/push.cjs",
+    "test:dismiss": "node test/dismiss.mjs",
+    "test:android": "node test/android-bridge.cjs",
+    "test:windl": "node test/windl.mjs",
+    "test:report": "node test/report.mjs",
+    "test:scroll": "python3 test/scroll.py",
+    "test:sandbox": "python3 test/sandbox.py",
+    "test:fit": "python3 test/fit.py",
+    "test:landscape": "python3 test/landscape.py",
+    "bench": "python3 test/bench.py"
+  },
+  "dependencies": {
+    "@block65/webcrypto-web-push": "^2.0.0",
+    "@sqlite.org/sqlite-wasm": "^3.53.4-build1",
+    "mimetext": "^3.0.28",
+    "postal-mime": "^2.4.0"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^24.1.3"
+  }
+}

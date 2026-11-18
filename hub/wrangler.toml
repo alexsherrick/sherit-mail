@@ -1,0 +1,80 @@
+name = "mailhub"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+# No workers.dev hostname: it served the same hub outside the yourdomain.example zone and its rules, and nothing uses it.
+workers_dev = false
+# No preview URLs: with workers_dev on they default on, and every old version then answers at
+# <version>-mailhub.<subdomain>.workers.dev against the live D1, R2 and secrets, including versions with holes since fixed.
+preview_urls = false
+routes = [{ pattern = "mail.yourdomain.example", custom_domain = true }]
+
+# The Worker still inlines the dynamic shell (app.html, the client JS, sw.js, the manifest) because those carry the build version or
+# need the session check. Everything immutable moved to./public and is served as a static asset, so no Data rule is needed any more.
+[[rules]]
+type = "Text"
+globs = ["**/*.html", "**/client/*.js", "**/client/*.webmanifest"]
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mailhub"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[r2_buckets]]
+binding = "STORE"
+bucket_name = "mailhub-store"
+
+[[send_email]]
+name = "EMAIL"
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# Gmail push (Cloud Pub/Sub). The topic Gmail publishes to, the service account Pub/Sub signs its push requests with, and the audience
+# set on the subscription. Fill the topic in to turn push on; the matching secret is GMAIL_PUSH_SECRET (wrangler secret put).
+# With a live watch the minute poll steps back to a ten-minute backstop; with these blank nothing changes.
+# A delivery shorter than the size Cloudflare declared is no longer stored as though whole. Mail already forwarded to Gmail keeps only
+# that copy; held mail is sent to Gmail from the bytes read; only if that send also fails is it refused (setReject is permanent).
+# Enabled 2026-10-04 under REVISIT R49's own condition, seven quiet days: 47 real deliveries since the check shipped on 2026-09-18 and
+# zero rawsize_mismatch events in the 30 days the event log covers.
+INBOUND_STRICT_RAWSIZE = "1"
+GMAIL_PUBSUB_TOPIC = ""
+GMAIL_PUSH_SA = ""
+GMAIL_PUSH_AUDIENCE = ""
+# Gmail access tokens for the CLI bearer token: "1" = allowed (every mint is logged as gmail_token_cli), anything else = browser sessions only.
+CLI_GMAIL_ACCESS = "1"
+# The hub's Gmail metadata mirror: "on" (or unset) = the hub follows Gmail and devices sync Gmail from it; "shadow" =
+# the hub follows Gmail but tells devices nothing, so it can be checked against Gmail first; "off" = stopped, devices sync Gmail directly.
+GMAIL_MIRROR = "on"
+# IMAP accounts synced by the Worker. The password is the named secret (wrangler secret put WORK_IMAP_PASSWORD).
+IMAP_ACCOUNTS = '[{"email":"sam@employer.example","label":"Work co","host":"mail.employer.example","port":993,"user":"sam@employer.example","secret":"WORK_IMAP_PASSWORD","smtp_host":"mail.employer.example","smtp_port":465}]'
+FORWARD_TO = "you@gmail.example"
+# The Gmail safety copy of domain mail: "off" since 2026-10-09, after the failure test passed.
+# With it off, only a "forward" rule (USPTO) and the emergency copy after a storage failure reach FORWARD_TO. Undo: "on" and deploy.
+GMAIL_COPY = "off"
+# Onboarded-domain authority (Email Sending + Routing). Adding a domain = onboard in Cloudflare + add it here + deploy.
+DOMAINS = "domain2.example,yourdomain.example,domain5.example,zone.test,zone.example,domain6.example,domain7.example"
+# Letterhead per From domain: a send from an address on a listed domain goes out with its HTML wrapped in this frame
+# (name, logo, accent colour, site, footer line); a reply quotes the mail it answers. "Letterhead" off in the composer, or `mail send
+# --plain`, sends it bare. Domains not listed are untouched. domain7.example: the Brandseven admin-inbox frame, moved here.
+BRANDS = '{"domain7.example":{"name":"Brandseven","logo":"https://domain7.example/assets/logo_sticker_email.png","color":"#f97316","site":"https://domain7.example","footer":"Have more questions? Just reply to this email."}}'
+# Google sign-in: only these Google accounts may sign in (comma-separated). Secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET.
+ALLOWED_GOOGLE_EMAIL = "you@gmail.example"
+# Set UI_PASSWORD_DISABLED = "1" once Google sign-in works, to retire the password form.
+UI_PASSWORD_DISABLED = "1"
+
+# Secrets (wrangler secret put): CLI_TOKEN, SESSION_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, RESEND_KEY_DOMAIN2, RESEND_KEY_DOMAIN3 (migration only)
+# Gmail accounts: GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET (a SEPARATE Google Cloud project/client, consent screen
+# in production, unverified, scope gmail.modify, redirect https://mail.yourdomain.example/auth/gmail/callback) and GMAIL_TOKEN_KEY
+# (32 random bytes base64; encrypts the stored refresh tokens: losing it means reconnecting every account).
+
+# Immutable client files (the SQLite engine, the search worker, the icons) are served as Workers Static Assets from./public.
+# Cloudflare: "Requests to static assets are free and unlimited... There is no additional cost for storing Assets", so these stop
+# counting against the 100,000 requests/day limit, and 1.5 MB leaves the Worker script. The dynamic shell (/, /app.js, /sw.js) is
+# unaffected: a request only becomes an asset when it matches a file in./public, and none of those names collide.
+[assets]
+directory = "./public"

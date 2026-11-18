@@ -1,0 +1,27 @@
+# mailhub-img: shrinks the hub's kept pictures with our own WebAssembly shrinker, every minute, one picture at a time,
+# in an isolate of its own. No public URL. Deploy from this folder through bin/harness_release.py, like the hub.
+name = "mailhub-img"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = false
+preview_urls = false
+
+[triggers]
+crons = ["* * * * *"]
+
+# A tick's 25 s of pictures is mostly CPU (encoding); a 240-frame GIF took 3.1 s at effort 2 on the Mac's V8. Room for a slow one.
+[limits]
+cpu_ms = 120000
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mailhub"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[r2_buckets]]
+binding = "STORE"
+bucket_name = "mailhub-store"

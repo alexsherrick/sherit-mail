@@ -1,0 +1,12 @@
+-- The absence clock needs a SECOND timestamp, and its key must be canonical.
+--
+-- Two stale paths:
+--  1. The DELETE that clears an account's absence only runs when the config parses sane. If an account RETURNS during a window
+--  where the config is malformed, the clear never happens; the row survives with its old first_missing_at, and `ON CONFLICT DO
+--  NOTHING` then preserves it when the account leaves again, so a removal months later matures instantly and retires work
+--  that was never absent for seven days.
+--  2. The INSERT stored the raw imap_ops.account value while the DELETE matched lower(account); a case mismatch left a row that
+--  could never be cleared.
+-- last_confirmed_at records the last time the account was actually OBSERVED missing. Retirement now requires both a long absence
+-- AND a recent observation, so an absence nobody has been watching cannot mature in the dark.
+ALTER TABLE imap_account_absent ADD COLUMN last_confirmed_at TEXT;

@@ -1,0 +1,13 @@
+# Every static file gets the headers the Worker puts on its own responses (security review 2026-11-13, D5: /search.worker.js,
+# /sqlite3.*, /pdf*.mjs and /icons/* went out with none of them). Rules that match the same path add up, so a header is set once.
+/*
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+
+# pdf.js's decoders: the PDF frame is an opaque origin, so its requests are cross-origin and need CORS; no cookie
+# is sent with them. The folder is named by pdf.js version, so its files never change in place.
+/pdfjs/*
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=31536000, immutable

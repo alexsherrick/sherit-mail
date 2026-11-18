@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The web client's own palette (app.html:root), so the bars and the splash are the page, not a frame around it. -->
+    <color name="page_bg">#FFFFFF</color>
+    <color name="accent">#3B5BDB</color>
+    <color name="icon_bg">#0E1334</color>
+</resources>

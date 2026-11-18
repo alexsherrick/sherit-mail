@@ -1,0 +1,62 @@
+# Sherit Mail for Windows: a native shell around the web client at mail.yourdomain.example. Build with../build.sh.
+[package]
+name = "sherit-mail"
+version = "1.0.6"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "SheritMail"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+# The same HTTP stack the updater already carries: reqwest over rustls with ring and the Windows certificate store.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+url = "2"
+percent-encoding = "2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+ab_glyph = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+winreg = "0.55"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_EnhancedStorage",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[dev-dependencies]
+png = "0.18"

@@ -1,0 +1,9 @@
+{
+  "name": "mailhub-shrink",
+  "private": true,
+  "type": "module",
+  "description": "Shrinks the mail hub's big stored pictures with sharp in a Cloudflare Container",
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  }
+}

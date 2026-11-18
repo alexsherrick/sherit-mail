@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# mail: CLI for the mailhub Worker. Token: ~/.config/mailhub/token, URL: ~/.config/mailhub/url
+set -euo pipefail
+CFG="${MAILHUB_CONFIG:-$HOME/.config/mailhub}"
+URL="${MAILHUB_URL:-$(cat "$CFG/url" 2>/dev/null || echo https://mail.yourdomain.example)}"
+TOKEN="${MAILHUB_TOKEN:-$(cat "$CFG/token")}"
+api() { curl -sS -H "Authorization: Bearer $TOKEN" "$@"; }
+# What reaches a terminal has mail's control codes dropped: JSON escapes C0 but not DEL or C1 (U+0080-009F), which a terminal may read as
+# CSI. Piped or redirected, the JSON is left exactly as sent.
+clean_out() { python3 -c 'import sys,re; sys.stdout.write(re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", sys.stdin.buffer.read().decode("utf-8", "replace")))'; }
+to_term() { if [ -t 1 ]; then clean_out; else cat; fi; }
+jq_or_cat() { if command -v jq >/dev/null; then jq "$@"; else cat; fi | to_term; }
+usage() { cat <<'U'
+usage:
+  mail inbox [N] [-q QUERY] [-b BOX]        list threads (BOX: inbox|unread|starred|archived|held|trash|all)
+  mail archive|trash|restore|star|unstar|unread|read THREAD_ID
+  mail purge THREAD_ID                      delete forever (thread must be in trash)
+  mail forward MESSAGE_ID --to ADDR [--from ADDR] [--body NOTE]
+  mail rules                                per-address forward/hold rules
+  mail read THREAD_ID|MESSAGE_ID            print a conversation (bodies as text); a message id opens its conversation
+  mail show MESSAGE_ID                      print one message (json)
+  mail send --from ADDR [--name "Display Name"] --to ADDR[,ADDR] --subject S (--body TEXT | --body-file F | stdin) [--cc ADDR] [--html FILE] [--attach FILE]... [--plain]
+  mail reply MESSAGE_ID (--body TEXT | --body-file F | stdin) [--all] [--to ADDR] [--cc ADDR] [--from ADDR] [--name "Display Name"] [--attach FILE]... [--dry-run]
+      --dry-run prints the From, To (after Reply-To), Cc, Subject and each file the reply would carry, and sends nothing
+      From may be any address on an onboarded domain (identities are suggestions, not a limit); --from "Name <addr>" also works
+  mail identities | mail identity add ADDR "Display Name"
+  mail events | mail stats | mail raw MESSAGE_ID
+  mail gmail watch                          set up / renew the Gmail push watch (Pub/Sub); the daily job renews it too
+  mail gmail accounts | mail gmail inbox ADDR [N] | mail gmail archive ADDR MSG_ID | mail gmail token ADDR | mail gmail disconnect ADDR
+  mail push test | mail push devices           Web Push to every registered device / list devices
+  mail schedule [pending|done|failed] | mail schedule cancel ID | mail remind "TITLE" AT   (AT = ISO time or +90m/+2h/+1d)
+  mail senders [pending|accepted|blocked] | mail senders accept ADDR | mail senders block ADDR
+  mail imap status | mail imap sync [--backfill N]   work mailbox engine (needs WORK_IMAP_PASSWORD)
+  mail revisit [all] | mail revisit add "TITLE" [YYYY-MM-DD] [--why TEXT] [--trigger TEXT] | mail revisit done ID [NOTE] | mail revisit snooze ID YYYY-MM-DD
+      parked decisions with a date or trigger to look again; the daily report lists what is due (whole list on Mondays)
+      (Gmail accounts connected in the UI; the CLI calls gmail.googleapis.com directly with a hub-minted access token)
+  mail resend-export (domain2|domain3) DIR     drain a Resend inbox to .eml files (no hub involved)
+U
+exit 1; }
+b64() { base64 < "$1" | tr -d '\n'; }
+# A known extension decides the type; `file` decides only the rest. `file` calls a python-docx.docx application/octet-stream
+# (Example_Addendum_A.docx), which the recipient's mail app offers as an unknown file.
+mime() { case "$(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]')" in
+  pdf) echo application/pdf;; doc) echo application/msword;; docx) echo application/vnd.openxmlformats-officedocument.wordprocessingml.document;;
+  xls) echo application/vnd.ms-excel;; xlsx) echo application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;;
+  pptx) echo application/vnd.openxmlformats-officedocument.presentationml.presentation;; zip) echo application/zip;;
+  png) echo image/png;; jpg|jpeg) echo image/jpeg;; txt) echo text/plain;; csv) echo text/csv;;
+  *) file --mime-type -b "$1" 2>/dev/null || echo application/octet-stream;; esac; }
+attachments_json() { local out="[]" f; for f in "$@"; do [ -n "$f" ] || continue; out=$(python3 - "$out" "$f" "$(b64 "$f")" "$(mime "$f")" <<'P'
+import sys,json,os; arr=json.loads(sys.argv[1]); arr.append({"filename":os.path.basename(sys.argv[2]),"content":sys.argv[3],"type":sys.argv[4]}); print(json.dumps(arr))
+P
+); done; echo "$out"; }
+resolve_thread() { local TID="$1"; if [ ${#TID} -lt 36 ]; then TID=$(api "$URL/api/threads?box=all&limit=500" | python3 -c "import sys,json; ts=[t['id'] for t in json.load(sys.stdin)['threads'] if t['id'].startswith(sys.argv[1])]; print(ts[0] if len(ts)==1 else '')" "$TID"); fi; [ -n "$TID" ] || { echo "thread not found or ambiguous" >&2; exit 1; }; echo "$TID"; }
+read_body() { # --body / --body-file / stdin
+  if [ -n "${BODY:-}" ]; then printf '%s' "$BODY"; elif [ -n "${BODY_FILE:-}" ]; then cat "$BODY_FILE"; elif [ ! -t 0 ]; then cat; else echo "body required (--body, --body-file, or stdin)" >&2; exit 1; fi; }
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  inbox)
+    N=50; Q=""; BOX="inbox"; while [ $# -gt 0 ]; do case "$1" in -q) Q="$2"; shift 2;; -b) BOX="$2"; shift 2;; *) N="$1"; shift;; esac; done
+    api "$URL/api/threads?limit=$N&box=$BOX&q=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$Q")" | python3 -c '
+import sys,json
+import re as _re
+_p = print
+print = lambda *a, **k: _p(*(_re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)) for x in a), **k)   # mail text never reaches the terminal as control codes
+for t in json.load(sys.stdin)["threads"]:
+    l=t.get("last") or {}
+    who = l.get("from_name") or l.get("from_addr") or ""
+    if l.get("direction")=="out":   # who it went to, not our own address
+        ta=l.get("to_addrs") or "[]"; ta=json.loads(ta) if isinstance(ta,str) else ta
+        rc=[a for a in ta if a.get("address")]
+        who="→ "+((rc[0].get("name") or rc[0]["address"])+(" +%d" % (len(rc)-1) if len(rc)>1 else "") if rc else (t.get("participants") or l.get("identity") or ""))
+    flags=("*" if t.get("unread") else " ")+("★" if t.get("starred") else " ")
+    lab=" ".join("["+x+"]" for x in json.loads(t.get("labels") or "[]"))
+    print(f'"'"'{flags} {t["id"][:8]}  {(l.get("created_at") or t["last_message_at"] or "")[:16]}  {t["message_count"]:>2}  {who[:26]:<26}  {(l.get("subject") or "")[:56]} {lab}'"'"')
+';;
+  read)
+    [ $# -ge 1 ] || usage; TID="$1"
+    [ ${#TID} -lt 36 ] && TID=$(api "$URL/api/threads?limit=200" | python3 -c "import sys,json; ts=[t['id'] for t in json.load(sys.stdin)['threads'] if t['id'].startswith(sys.argv[1])]; print(ts[0] if len(ts)==1 else '')" "$TID")
+    [ -n "$TID" ] || { echo "thread not found or ambiguous (a message id needs all 36 characters; or: mail show MESSAGE_ID)" >&2; exit 1; }
+    # A message id opens its conversation. /api/threads/<message id> answers {"error":"not found"}, and the printer below died on
+    # KeyError: 'messages'.
+    J=$(api "$URL/api/threads/$TID")
+    if ! printf '%s' "$J" | python3 -c 'import sys,json; sys.exit(0 if "messages" in json.load(sys.stdin) else 1)' 2>/dev/null; then
+      MT=$(api "$URL/api/messages/$TID" | python3 -c 'import sys,json; print((json.load(sys.stdin).get("message") or {}).get("thread_id") or "")' 2>/dev/null || true)
+      [ -n "$MT" ] || { echo "no conversation or message with id $TID" >&2; exit 1; }
+      J=$(api "$URL/api/threads/$MT")
+    fi
+    printf '%s' "$J" | python3 -c '
+import sys,json,re,html
+import re as _re
+_p = print
+print = lambda *a, **k: _p(*(_re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)) for x in a), **k)   # mail text never reaches the terminal as control codes
+d=json.load(sys.stdin)
+for m in d["messages"]:
+    body=m.get("body_text") or re.sub(r"<[^>]+>"," ",html.unescape(m.get("body_html") or ""))
+    to=", ".join(a["address"] for a in m["to_addrs"])
+    print("="*78); print(f'"'"'[{m["id"]}] {m["direction"].upper()}  {m["created_at"][:19]}'"'"'); print(f'"'"'From: {m.get("from_name","")} <{m["from_addr"]}>   To: {to}'"'"'); print(f'"'"'Subject: {m.get("subject","")}'"'"')
+    if m["attachments"]: print("Attachments: " + ", ".join(f'"'"'{a["filename"]} ({a["size_bytes"]} B, id {a["id"]})'"'"' for a in m["attachments"]))
+    print(); print(body.strip()[:20000]); print()
+';;
+  show) [ $# -ge 1 ] || usage; api "$URL/api/messages/$1" | jq_or_cat .;;
+  raw) [ $# -ge 1 ] || usage   # to a terminal, the message's escape codes are dropped; piped or redirected, the bytes are as stored
+    if [ -t 1 ]; then api "$URL/api/raw/$1" | clean_out; else api "$URL/api/raw/$1"; fi;;   # clean_out also drops UTF-8 C1
+  send)
+    FROM=""; NAME=""; TO=""; CC=""; SUBJ=""; BODY=""; BODY_FILE=""; HTMLF=""; ATT=(); PLAIN=""
+    while [ $# -gt 0 ]; do case "$1" in --plain) PLAIN=1; shift;; --from) FROM="$2"; shift 2;; --name) NAME="$2"; shift 2;; --to) TO="$2"; shift 2;; --cc) CC="$2"; shift 2;; --subject) SUBJ="$2"; shift 2;; --body) BODY="$2"; shift 2;; --body-file) BODY_FILE="$2"; shift 2;; --html) HTMLF="$2"; shift 2;; --attach) ATT+=("$2"); shift 2;; *) usage;; esac; done
+    [ -n "$FROM" ] && [ -n "$TO" ] && [ -n "$SUBJ" ] || usage
+    TEXT=$(read_body); ATTJ=$(attachments_json ${ATT[@]+"${ATT[@]}"})
+    python3 - "$FROM" "$TO" "$CC" "$SUBJ" "$TEXT" "$HTMLF" "$ATTJ" "$NAME" "$PLAIN" <<'P' > /tmp/mailhub_send.json
+import sys,json
+f,to,cc,s,t,h,att,name,plain=sys.argv[1:10]
+d={"from":f,"to":[x.strip() for x in to.split(",") if x.strip()],"subject":s,"text":t}
+if plain: d["plain"]=True
+if name: d["from_name"]=name
+if cc: d["cc"]=[x.strip() for x in cc.split(",") if x.strip()]
+if h: d["html"]=open(h).read()
+a=json.loads(att)
+if a: d["attachments"]=a
+print(json.dumps(d))
+P
+    api -X POST -H "Content-Type: application/json" --data-binary @/tmp/mailhub_send.json "$URL/api/send"; echo; rm -f /tmp/mailhub_send.json;;
+  reply)
+    [ $# -ge 1 ] || usage; MID="$1"; shift; MODE="one"; TO=""; CC=""; FROM=""; NAME=""; BODY=""; BODY_FILE=""; ATT=(); DRY=""; PLAIN=""
+    while [ $# -gt 0 ]; do case "$1" in --all) MODE="all"; shift;; --plain) PLAIN=1; shift;; --dry-run) DRY=1; shift;; --to) TO="$2"; shift 2;; --cc) CC="$2"; shift 2;; --from) FROM="$2"; shift 2;; --name) NAME="$2"; shift 2;; --body) BODY="$2"; shift 2;; --body-file) BODY_FILE="$2"; shift 2;; --attach) ATT+=("$2"); shift 2;; *) usage;; esac; done
+    TEXT=$(read_body); ATTJ=$(attachments_json ${ATT[@]+"${ATT[@]}"})
+    python3 - "$MODE" "$TO" "$CC" "$FROM" "$TEXT" "$ATTJ" "$NAME" "$PLAIN" <<'P' > /tmp/mailhub_reply.json
+import sys,json
+mode,to,cc,f,t,att,name,plain=sys.argv[1:9]
+d={"mode":mode,"text":t}
+if plain: d["plain"]=True
+if name: d["from_name"]=name
+if to: d["to"]=[x.strip() for x in to.split(",") if x.strip()]
+if cc: d["cc"]=[x.strip() for x in cc.split(",") if x.strip()]
+if f: d["from"]=f
+a=json.loads(att)
+if a: d["attachments"]=a
+print(json.dumps(d))
+P
+    # --dry-run asks the hub's /reply/preview, which resolves the same reply and sends nothing; a hub without it answers 404.
+    if [ -n "$DRY" ]; then
+      api -X POST -H "Content-Type: application/json" --data-binary @/tmp/mailhub_reply.json "$URL/api/messages/$MID/reply/preview" | python3 -c '
+import sys,json
+import re as _re
+_p = print
+print = lambda *a, **k: _p(*(_re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)) for x in a), **k)   # mail text never reaches the terminal as control codes
+d=json.load(sys.stdin)
+if not d.get("dry_run"): print("preview failed: " + json.dumps(d), file=sys.stderr); sys.exit(1)
+print("DRY RUN, nothing sent (via %s)" % d["via"])
+print("From:    " + d["from"]); print("To:      " + ", ".join(d["to"]))
+if d["cc"]: print("Cc:      " + ", ".join(d["cc"]))
+if d["bcc"]: print("Bcc:     " + ", ".join(d["bcc"]))
+print("Subject: " + d["subject"])
+if d.get("in_reply_to"): print("Answers: " + d["in_reply_to"])
+for a in d["attachments"]: print("Attach:  %s  %s  %s bytes" % (a["filename"], a["type"], format(a["bytes"], ",")))
+' || { rm -f /tmp/mailhub_reply.json; exit 1; }
+      rm -f /tmp/mailhub_reply.json; exit 0
+    fi
+    api -X POST -H "Content-Type: application/json" --data-binary @/tmp/mailhub_reply.json "$URL/api/messages/$MID/reply"; echo; rm -f /tmp/mailhub_reply.json;;
+  archive|trash|restore|star|unstar|unread|read)
+    [ $# -ge 1 ] || usage; TID="$1"; TID=$(resolve_thread "$TID")
+    case "$cmd" in archive) B='{"state":"archived"}';; trash) B='{"state":"trash"}';; restore) B='{"state":"inbox"}';; star) B='{"starred":true}';; unstar) B='{"starred":false}';; unread) B='{"unread":true}';; read) B='{"unread":false}';; esac
+    api -X PATCH -H "Content-Type: application/json" -d "$B" "$URL/api/threads/$TID"; echo;;
+  purge) [ $# -ge 1 ] || usage; TID=$(resolve_thread "$1"); api -X DELETE "$URL/api/threads/$TID"; echo;;
+  forward)
+    [ $# -ge 2 ] || usage; MID="$1"; shift; TO=""; FROM=""; BODY=""; BODY_FILE=""
+    while [ $# -gt 0 ]; do case "$1" in --to) TO="$2"; shift 2;; --from) FROM="$2"; shift 2;; --body) BODY="$2"; shift 2;; --body-file) BODY_FILE="$2"; shift 2;; *) usage;; esac; done
+    [ -n "$TO" ] || usage; TEXT=""; if [ -n "$BODY" ] || [ -n "$BODY_FILE" ] || [ ! -t 0 ]; then TEXT=$(read_body); fi
+    python3 - "$TO" "$FROM" "$TEXT" <<'P' > /tmp/mailhub_fwd.json
+import sys,json; to,f,t=sys.argv[1:4]; d={"to":[x.strip() for x in to.split(",") if x.strip()],"text":t}
+if f: d["from"]=f
+print(json.dumps(d))
+P
+    api -X POST -H "Content-Type: application/json" --data-binary @/tmp/mailhub_fwd.json "$URL/api/messages/$MID/forward"; echo; rm -f /tmp/mailhub_fwd.json;;
+  revisit)
+    sub="${1:-list}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      list|all) api "$URL/api/revisit" | python3 -c "
+import sys, json; items = json.load(sys.stdin)['items']; show_all = '$sub' == 'all'
+for i in items:
+    if i.get('status') == 'done' and not show_all: continue
+    when = i.get('when') or 'on trigger'; print(f\"{i['id']:>4}  {'DONE ' if i.get('status') == 'done' else ''}{when}  {i['title']}\")
+    if i.get('why'): print(f\"      why: {i['why']}\")
+    if i.get('trigger'): print(f\"      trigger: {i['trigger']}\")
+";;
+      add) TITLE="${1:-}"; [ -n "$TITLE" ] || usage; shift; WHEN=""; WHY=""; TRIG=""; [ $# -gt 0 ] && [[ "${1}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && { WHEN="$1"; shift; }
+        while [ $# -gt 0 ]; do case "$1" in --why) WHY="$2"; shift 2;; --trigger) TRIG="$2"; shift 2;; *) usage;; esac; done
+        python3 -c "import json,sys; print(json.dumps({'op':'add','title':sys.argv[1],'when':sys.argv[2] or None,'why':sys.argv[3],'trigger':sys.argv[4]}))" "$TITLE" "$WHEN" "$WHY" "$TRIG" | api -X POST -H "Content-Type: application/json" -d @- "$URL/api/revisit" | jq_or_cat '.added';;
+      done) [ $# -ge 1 ] || usage; python3 -c "import json,sys; print(json.dumps({'op':'done','id':sys.argv[1],'note':sys.argv[2] if len(sys.argv)>2 else ''}))" "$@" | api -X POST -H "Content-Type: application/json" -d @- "$URL/api/revisit" >/dev/null && echo "done: $1";;
+      snooze) [ $# -ge 2 ] || usage; python3 -c "import json,sys; print(json.dumps({'op':'snooze','id':sys.argv[1],'when':sys.argv[2]}))" "$@" | api -X POST -H "Content-Type: application/json" -d @- "$URL/api/revisit" >/dev/null && echo "snoozed: $1 -> $2";;
+      report) api "$URL/api/revisit?report=1";;
+      *) usage;;
+    esac;;
+  rules) api "$URL/api/rules" | jq_or_cat .;;
+  identities) api "$URL/api/identities" | jq_or_cat .;;
+  identity) [ "${1:-}" = "add" ] && [ -n "${2:-}" ] || usage; api -X POST -H "Content-Type: application/json" -d "{\"email\":\"$2\",\"display_name\":\"${3:-}\"}" "$URL/api/identities"; echo;;
+  resend-export)
+    # Out-of-hub drain: download every received email (.eml) from a Resend account to a directory, using the local key.
+    ACC="${1:-}"; DIR="${2:-}"; [ -n "$ACC" ] && [ -n "$DIR" ] || usage
+    case "$ACC" in domain2) KF="$CFG/resend-domain2.vars";; domain3) KF="$CFG/resend-domain3.vars";; *) usage;; esac
+    RK=$(grep -o 're_[A-Za-z0-9_]*' "$KF" | head -1); mkdir -p "$DIR"
+    curl -sS -H "Authorization: Bearer $RK" "https://api.resend.com/emails/receiving?limit=100" | python3 -c '
+import sys,json,subprocess,os
+key=sys.argv[1]; d=sys.argv[2]; items=json.load(sys.stdin).get("data",[])
+n=0
+for it in items:
+    out=os.path.join(d, it["id"]+".eml")
+    if os.path.exists(out): continue
+    det=json.loads(subprocess.check_output(["curl","-sS","-H","Authorization: Bearer "+key,"https://api.resend.com/emails/receiving/"+it["id"]]))
+    url=(det.get("raw") or {}).get("download_url")
+    if not url: print("no raw url", it["id"]); continue
+    subprocess.check_call(["curl","-sS","-o",out,url]); n+=1
+    with open(os.path.join(d,"index.tsv"),"a") as f: f.write("\t".join([it["id"], it.get("created_at",""), it.get("from",""), ",".join(it.get("to",[])), (it.get("subject") or "").replace("\t"," ")])+"\n")
+print(f"{len(items)} listed, {n} downloaded to {d}")' "$RK" "$DIR";;
+  gmail)
+    sub="${1:-}"; shift || true
+    gtoken() { api -X POST "$URL/api/gmail/accounts/$1/token" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d.get("access_token"); print(t) if t else sys.exit("error: "+json.dumps(d))'; }
+    case "$sub" in
+      accounts) api "$URL/api/gmail/accounts" | jq_or_cat .;;
+      token) [ -n "${1:-}" ] || usage; api -X POST "$URL/api/gmail/accounts/$1/token"; echo;;
+      watch) api -X POST "$URL/api/gmail/watch" | jq_or_cat '.';;
+      disconnect) [ -n "${1:-}" ] || usage; api -X DELETE "$URL/api/gmail/accounts/$1"; echo;;
+      inbox)
+        [ -n "${1:-}" ] || usage; AT=$(gtoken "$1"); N="${2:-20}"
+        LIST=$(curl -sS -H "Authorization: Bearer $AT" "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=$N&labelIds=INBOX")
+        python3 - "$AT" "$LIST" <<'P'
+import sys,json,subprocess,datetime
+import re as _re
+_p = print
+print = lambda *a, **k: _p(*(_re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)) for x in a), **k)   # mail text never reaches the terminal as control codes
+at=sys.argv[1]; d=json.loads(sys.argv[2])
+if "error" in d: sys.exit("error: "+json.dumps(d["error"]))
+for m in d.get("messages",[]):
+    j=json.loads(subprocess.check_output(["curl","-sS","-H","Authorization: Bearer "+at,"https://gmail.googleapis.com/gmail/v1/users/me/messages/"+m["id"]+"?format=metadata&metadataHeaders=From&metadataHeaders=Subject"]))
+    h={x["name"].lower():x["value"] for x in j.get("payload",{}).get("headers",[])}
+    t=datetime.datetime.fromtimestamp(int(j.get("internalDate","0"))/1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+    print("{}  {}  {:<30}  {}".format(j["id"], t, h.get("from","")[:30], h.get("subject","")[:60]))
+P
+        ;;
+      archive) [ -n "${2:-}" ] || usage; AT=$(gtoken "$1"); curl -sS -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d '{"removeLabelIds":["INBOX"]}' "https://gmail.googleapis.com/gmail/v1/users/me/messages/$2/modify"; echo;;
+      *) usage;;
+    esac;;
+  push)
+    case "${1:-}" in
+      test) api -X POST "$URL/api/push/test"; echo;;
+      devices|"") api "$URL/api/push/subscriptions" | jq_or_cat .;;
+      *) usage;;
+    esac;;
+  schedule)
+    case "${1:-pending}" in
+      cancel) [ -n "${2:-}" ] || usage; api -X DELETE "$URL/api/schedule/$2"; echo;;
+      pending|done|failed|cancelled) api "$URL/api/schedule?status=$1" | python3 -c 'import sys,json,re; c=lambda x: re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)); [print(*map(c, (a["id"][:8], a["kind"], a["account"], a["due_at"][:16], (a.get("payload") or {}).get("subject") or (a.get("payload") or {}).get("title") or a.get("ref") or "", a.get("error") or ""))) for a in json.load(sys.stdin)["actions"]]';;
+      *) usage;;
+    esac;;
+  remind)
+    [ $# -ge 2 ] || usage; TITLE="$1"; AT="$2"
+    DUE=$(python3 - "$AT" <<'P'
+import sys,re,datetime
+a=sys.argv[1]; m=re.match(r"^\+(\d+)([mhd])$",a)
+if m:
+    n=int(m.group(1)); d={"m":datetime.timedelta(minutes=n),"h":datetime.timedelta(hours=n),"d":datetime.timedelta(days=n)}[m.group(2)]
+    print((datetime.datetime.now(datetime.timezone.utc)+d).strftime("%Y-%m-%dT%H:%M:%SZ"))
+else: print(a)
+P
+)
+    api -X POST -H "Content-Type: application/json" -d "{\"kind\":\"reminder\",\"account\":\"hub\",\"due_at\":\"$DUE\",\"payload\":{\"title\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TITLE")}}" "$URL/api/schedule"; echo;;
+  senders)
+    case "${1:-pending}" in
+      accept|block) [ -n "${2:-}" ] || usage; ST=$([ "$1" = accept ] && echo accepted || echo blocked); api -X POST -H "Content-Type: application/json" -d "{\"address\":\"$2\",\"status\":\"$ST\"}" "$URL/api/senders"; echo;;
+      pending|accepted|blocked) api "$URL/api/senders?status=$1" | python3 -c 'import sys,json,re; c=lambda x: re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)); d=json.load(sys.stdin); print("counts:", d["counts"]); [print(*map(c, (s["last_seen_at"][:16], s["status"], s["address"], s.get("first_account") or ""))) for s in d["senders"][:100]]';;
+      *) usage;;
+    esac;;
+  imap)
+    case "${1:-status}" in
+      status) api "$URL/api/imap/status" | jq_or_cat .;;
+      sync) BF=0; [ "${2:-}" = "--backfill" ] && BF="${3:-200}"; api -X POST -H "Content-Type: application/json" -d "{\"backfill\":$BF,\"sweep\":true}" "$URL/api/imap/sync" | jq_or_cat .;;
+      *) usage;;
+    esac;;
+  events) api "$URL/api/events" | python3 -c 'import sys,json,re; c=lambda x: re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(x)); [print(c(e["at"]), c(e["kind"]), c(e.get("message_id") or ""), c((e.get("detail") or "")[:100])) for e in json.load(sys.stdin)["events"]]';;   # sender names and subjects are in event details
+  stats) api "$URL/api/stats"; echo;;
+  *) usage;;
+esac

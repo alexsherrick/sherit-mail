@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sherit Mail</string>
+    <string name="channel_mail">New mail</string>
+    <string name="channel_mail_desc">A notification for each new conversation</string>
+    <string name="shortcut_compose">New message</string>
+</resources>

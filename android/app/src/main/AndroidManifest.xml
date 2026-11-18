@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- In-app updates from the hub: Android still asks to confirm each install. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Android 11+ hides other apps unless asked: without this, CustomTabsClient.getPackageName() finds no browser, Auth Tab
+         is never detected, and sign-in falls back to a plain Custom Tab whose redirect back to the app Chrome may not follow. -->
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.Sherit"
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- the end of sign-in when the browser has no Auth Tab, and the "New message" shortcut -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sheritmail" />
+            </intent-filter>
+            <!-- mailto: links everywhere on the phone -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.SENDTO" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mailto" />
+            </intent-filter>
+            <!-- "Share" a link or some text into a new message -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!-- Every notification opens through this hand-off screen: a startup window Android puts up for a tap on the
+             lock screen, and sometimes never takes down, belongs to it and goes when it finishes, instead of covering MainActivity.
+             relinquishTaskIdentity: when a tap starts the app cold, this screen is the task's root, and without it the
+             task's base intent stayed this screen's after it finished. Every later tap then asked Android to launch the task's own root
+             with an equal intent, which it answers by bringing the task forward and starting nothing (ActivityStarter.complyActivityFlags),
+             so the route never reached the page. With it the task takes MainActivity's identity the moment it is started. -->
+        <activity
+            android:name=".OpenActivity"
+            android:exported="false"
+            android:relinquishTaskIdentity="true"
+            android:theme="@style/Theme.Sherit.Open" />
+
+        <service android:name=".MailMessagingService" android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <receiver android:name=".ActionReceiver" android:exported="false" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/update_paths" />
+        </provider>
+        <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="mail" />
+    </application>
+</manifest>

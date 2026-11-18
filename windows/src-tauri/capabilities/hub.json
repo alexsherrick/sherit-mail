@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "hub",
+  "description": "The hub's own pages may set the taskbar badge and say a conversation is open. Nothing else: no core or plugin commands.",
+  "windows": ["main"],
+  "remote": { "urls": ["https://mail.yourdomain.example/*"] },
+  "permissions": ["allow-badge", "allow-opened"]
+}
