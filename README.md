@@ -223,7 +223,7 @@ Mac with `windows/build.sh`; `--publish` uploads it to the hub, and installed co
 
 ## Tests
 
-119 test files: the Worker against real SQLite, the client in jsdom against a fake network, the picture shrinker against sharp, and
+122 test files: the Worker against real SQLite, the client in jsdom against a fake network, the picture shrinker against sharp, and
 Playwright driving phone, tablet and desktop sizes. `python3 test/run_all.py` (in `hub/`) runs all of them in parallel, in a little
 over two minutes on my Mac. `npm run test:smoke` and `npm run test:ingest` are the quick ones. `--control` also runs tests against
 the code from before their fix, to check they would have caught the bug. The two picture-shrinker tests need `npm install` in

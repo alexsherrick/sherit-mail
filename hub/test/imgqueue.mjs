@@ -89,6 +89,11 @@ globalThis.fetch = async (input) => {
   if (u.pathname === "/always.png") return new Response("gone", { status: 500 });
   if (u.pathname === "/big.png") return ok(9 * MIB);
   if (u.pathname === "/page.png") return new Response("<html></html>", { headers: { "content-type": "text/html" } });
+  // A PNG under a wrong type (a school district's mail host, a clinic's CDN), an SVG, and a picture that needs its token
+  if (u.pathname === "/mislabeled.png") return new Response(png(1500), { headers: { "content-type": "application/x-www-form-urlencoded" } });
+  if (u.pathname === "/undef.png") return new Response(png(1600), { headers: { "content-type": "undefined" } });
+  if (u.pathname === "/icon.svg") return new Response('<svg xmlns="http://www.w3.org/2000/svg"/>', { headers: { "content-type": "image/svg+xml" } });
+  if (u.pathname === "/tok.png") return u.searchParams.get("alt") === "media" && u.searchParams.get("token") === "abc" ? ok(1700) : new Response("no token", { status: 403 });
   return new Response("nope", { status: 404 });
 };
 globalThis.caches = { default: { match: async () => undefined, put: async () => {} } };
@@ -239,6 +244,36 @@ const BIG = { images: 99, bytes: 1e9 };
   const d = await s.m.drainImgQueue(s.env); s.env.STORE.put = put0;
   const ev = s.sq.prepare("SELECT detail FROM events WHERE kind = 'img_prefetch' AND detail LIKE 'queue%'").all().map((x) => x.detail);
   check(d.stored === 0 && !ev.some((e) => /from=put\.example/.test(e)) && ev.every((e) => !/stored=-/.test(e)), `a store that fails is counted for no one (${ev.join(" | ")})`);
+}
+// ---------- a bare src is read to its end, and a picture's bytes decide its type ----------
+// Google's notices write `src=https://…?alt=media&amp;token=…` unquoted; the reader stopped at the first `=`, so the arrival fetched
+// `…?alt`, the host refused it, and the open (asking for the same cut URL) was withheld. A PNG served as
+// application/x-www-form-urlencoded, or as "undefined", was given up as "not an image".
+const TOK = IMG("/tok.png") + "?alt=media&token=abc";
+const bareMail = `<img src=${IMG("/tok.png")}?alt=media&amp;token=abc alt="Visit us" width=33><img src="${IMG("/mislabeled.png")}"><img src="${IMG("/undef.png")}"><img src="${IMG("/icon.svg")}">`;
+async function bareAndTyped(src, tag) {
+  const s = await setup(src, tag);
+  const urls = s.m.prefetchImageUrls(bareMail);
+  const r = await s.m.prefetchImages(s.env, bareMail, "test", { left: { ...BIG } });
+  const opens = { tok: await s.open(TOK), mis: await s.open("/mislabeled.png"), undef: await s.open("/undef.png"), svg: await s.open("/icon.svg") };
+  return { s, urls, r, opens };
+}
+{
+  const { s, urls, r, opens } = await bareAndTyped(SRC, "b");
+  check(urls.includes(TOK) && !urls.some((u) => /\?alt$/.test(u)), `a bare src is read to its end, token and all (${urls.filter((u) => /tok/.test(u)).join(", ")})`);
+  check(r.stored === 3 && r.failed === 1, `arrival keeps the tokened picture and the two mislabelled PNGs, and fails the SVG (${JSON.stringify(r)})`);
+  check(opens.tok.status === 200 && opens.tok.source === "r2" && opens.tok.asked === 0, `the tokened picture opens from R2 (${JSON.stringify(opens.tok)})`);
+  check([opens.mis, opens.undef].every((o) => o.status === 200 && o.source === "r2" && o.asked === 0), `so do the PNGs served as form data and as "undefined" (${JSON.stringify([opens.mis, opens.undef])})`);
+  const kept = [...s.r2.values()].filter((x) => x.buf.byteLength === 1500 || x.buf.byteLength === 1600);
+  check(kept.length === 2 && kept.every((x) => x.ct === "image/png"), `and they are kept as image/png, what their bytes are (${kept.map((x) => x.ct)})`);
+  const sv = s.row("/icon.svg");
+  check(sv && sv.state === "dead" && sv.note === "not an image" && opens.svg.source === "withheld" && opens.svg.asked === 0, `an SVG is still not an image: given up, withheld (${sv && [sv.state, sv.note]}, ${opens.svg.source})`);
+}
+if (gitHas("f9eaedd")) {
+  const OLD = execSync("git show f9eaedd:hub/src/index.js", { cwd: HUB, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const { urls, r, opens } = await bareAndTyped(OLD, "bc");
+  check(!urls.includes(TOK) && urls.some((u) => /\?alt$/.test(u)), `CONTROL — f9eaedd's Worker reads the bare src as …?alt (${urls.filter((u) => /tok/.test(u)).join(", ")})`);
+  check(r.stored === 0 && opens.mis.status === 404 && opens.undef.status === 404, `CONTROL — and gives up both mislabelled PNGs (${JSON.stringify(r)}; ${opens.mis.source}, ${opens.undef.source})`);
 }
 // ---------- CONTROL ----------
 if (gitHas("f6beaa9")) {

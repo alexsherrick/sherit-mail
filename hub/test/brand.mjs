@@ -57,6 +57,17 @@ function world() {
   const row = w.sq.prepare("SELECT body_html, body_text FROM messages WHERE direction = 'out' ORDER BY created_at DESC LIMIT 1").get();
   check(row && row.body_html.includes(LOGO) && row.body_text === text, "the Sent copy holds the framed HTML and the written text");
 }
+{ // web addresses in a branded plain-text send become links; text around them still escaped; punctuation stays outside
+  const w = world();
+  // example.com, not the brand's own domain: the public copy renames that to a.example one, which the linker does not take as a domain
+  const text = "Get it: https://example.com/app/id123.\nOn Android? Join at example.com/android.\nMail sam@example.com, <b> & co.";
+  const r = await w.call("/api/send", { from: "hello@domain7.example", to: ["c@example.com"], subject: "App", text });
+  const h = (w.sends[0] || {}).html || "";
+  check(r.status === 200 && h.includes('Get it: <a href="https://example.com/app/id123">https://example.com/app/id123</a>.<br>'), "an https address is a link, its full stop outside it");
+  check(h.includes('Join at <a href="https://example.com/android">example.com/android</a>.<br>'), "a bare domain with a path is a link to https://");
+  check(h.includes("Mail sam@example.com, &lt;b&gt; &amp; co.") && !h.includes('href="https://example.com,'), "an email address is not linked and the text around is escaped");
+  check(((w.sends[0] || {}).text) === text, "the plain-text part is still exactly what was written");
+}
 { // a send from another of the user's domains: nothing added
   const w = world();
   const r = await w.call("/api/send", { from: "sam@domain2.example", to: ["friend@example.com"], subject: "Dinner", text: "Thursday?" });

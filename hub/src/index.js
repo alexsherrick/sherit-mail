@@ -573,8 +573,11 @@ async function fetchImageSafely(u, max = IMG_MAX) {
   }
   if (!up.ok) return { ok: false, status: 502, msg: "upstream " + up.status };
   let ct = (up.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
-  const generic = !ct || /octet-stream$/.test(ct); // some CDNs (one sender's image host) send no type at all: the magic number decides
-  if (!generic && !/^image\/(png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)$/.test(ct)) return { ok: false, status: 415, msg: "not an image" };
+  // Any type but one of these is not believed either way: the magic number decides, and the picture is served as what its bytes are.
+  // Some hosts send no type (one sender's image host), and some the wrong one: a school district's mail host serves its PNG
+  // logo as application/x-www-form-urlencoded and a clinic's CDN as "undefined", which browsers draw and the hub refused.
+  // An SVG, a font, a page or a stylesheet still has no image magic number, and is still "not an image".
+  const generic = !/^image\/(png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)$/.test(ct);
   const declared = parseInt(up.headers.get("content-length") || "0", 10);
   if (declared > max) return { ok: false, status: 413, msg: "too large" };
   // Stream through a counting transform: nothing is buffered, the stream is aborted past `max`, and the first bytes must
@@ -742,7 +745,10 @@ function spyThen(s, a, b) {
 }
 const SPY_LINEAR = SPY_TRACKERS.map(([name, rx]) => { const p = rx.source.split(/\(\.\*\)\?|\.\*\?/); return p.length === 2 && !/(^|[^\\])(\\\\)*\\$/.test(p[0]) ? [name, new RegExp(p[0], rx.flags + "g"), new RegExp(p[1], rx.flags)] : [name, rx, null]; });   // (not split after an escaping backslash)
 const spyTracker = (url) => { for (const [name, a, b] of SPY_LINEAR) if (b ? spyThen(url, a, b) : a.test(url)) return name; return null; };
-const TAG_VAL = /("([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/.source;
+// An unquoted value runs to the next HTML whitespace or `>`, as the browser reads it (WHATWG 13.2.5.38, "attribute value (unquoted)
+// state": a `=`, quote, `<` or backtick there is a parse error and is kept in the value). Stopping at `=` cut Google's
+// `src=https://…?alt=media&amp;token=…` to `…?alt`: the picture was fetched without its token, refused, and shown broken.
+const TAG_VAL = /("([^"]*)"|'([^']*)'|([^\t\n\f\r >]+))/.source;
 // Where an attribute name may begin: after whitespace, or straight after the closing quote of the attribute before it. HTML allows
 // the second (WHATWG 13.2.5.39, "after attribute value (quoted) state": anything but whitespace, / or > is a missing-whitespace-
 // between-attributes parse error and is reconsumed as the next attribute's name), and one sender's templates write every <img> that
@@ -855,7 +861,7 @@ function prefetchUrlsOf(h) {
   const out = new Set();
   const add = (d) => { if (String(d).length > 2048) return; try { const u = new URL(/^\/\//.test(d) ? "https:" + d : d); if (/^https?:$/.test(u.protocol) && u.href.length <= 2048) out.add(u.href); } catch (_) {} };   // no queue row for a 100 KB "URL"
   const px = (v) => { v = String(v || "").trim(); if (!v) return; const d = htmlUnent(v); if (/^(https?:)?\/\//i.test(d)) add(d); };
-  const VAL = /("([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/.source;
+  const VAL = TAG_VAL;
   const attr = (name, fn, tags = "img|td|th|table|body|div") => { for (const m of h.matchAll(new RegExp("(<(?:" + tags + ")\\b[^<>]*?" + ATTR_AT + name + "\\s*=\\s*)" + VAL, "gi"))) fn(m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : m[5]); };
   attr("src", px); attr("background", px);
   attr("srcset", (v) => { for (const c of srcsetCandidates(v)) px(c.url); }, "img|source|td|th|table|body|div");
@@ -903,6 +909,9 @@ export async function prefetchImages(env, html, tag, o = {}) {
   // A From whose domain cannot be read had no share at all; every such sender now shares one, "-".
   const dom = /^[a-z0-9.-]+$/.test(String(o.from || "").toLowerCase().split("@")[1] || "") ? lockRoot(String(o.from).toLowerCase().split("@")[1]) : "";
   const org = dom || "-";
+  // Queued only (o.queueOnly: the mirror's picture fill, gmailPicFill): every row is due now and the cron's drain fetches it, under the
+  // same allowance and shares; nothing is fetched here.
+  if (o.queueOnly) { try { await env.DB.batch(all.map((h) => imgQueueAhead(env.DB, h, null, org))); } catch (_) { return { n: 0, queued: 0, blocked: hits.length }; } return { n: all.length, queued: all.length, blocked: hits.length }; }
   try { await env.DB.batch(all.map((h, i) => imgQueueAhead(env.DB, h, i < urls.length ? busy : null, org))); } catch (_) {}
   const left = o.left || (await prefetchAllowance(env));
   const mine = await prefetchDomainLeft(env, org);   // this sender's share left today
@@ -1469,7 +1478,7 @@ function normSubject(s) {
 // wrote it into its References: a sender's own header, and the text after a blank line the start of the user's reply.
 // Prefs rows the server alone owns: the session generation ("sign out everywhere"; a client that could write it brought
 // every revoked cookie back) and the native apps' sign-in codes, readable mid-sign-in. Never sent to a client, never written by one.
-const PREF_SERVER_ONLY = (k) => k === "session_gen" || k === "revisit" || k === "handled" || k.startsWith("applogin:") || k.startsWith("appcb:") || k.startsWith("imaptry:") || k.startsWith("imgsweep:");
+const PREF_SERVER_ONLY = (k) => k === "session_gen" || k === "revisit" || k === "handled" || k.startsWith("applogin:") || k.startsWith("appcb:") || k.startsWith("gmailticket:") || k.startsWith("imaptry:") || k.startsWith("imgsweep:");
 function parseIdList(h) { return ((h || "").toString().match(/<[^<>\s]+>/g) || []).map((x) => x.trim()); }
 // One header id (Message-ID, In-Reply-To's first) as it may go into a header: no space or control character at all. An encoded word
 // that decodes to CR/LF (postal-mime decodes message-id, in-reply-to and references) is how a mail carried one.
@@ -1579,6 +1588,20 @@ function addLabel(json, label) { const a = new Set(JSON.parse(json || "[]")); if
 // metas stay, which tells Apple Mail and Outlook the design already handles dark mode and is not to be recoloured.
 function brandsCfg(env) { let o = {}; try { o = JSON.parse(env?.BRANDS || "{}"); } catch (_) { o = {}; } const out = {}; for (const [d, b] of Object.entries(o && typeof o === "object" ? o : {})) if (b && typeof b === "object" && typeof b.name === "string" && b.name) out[lc(d)] = b; return out; }
 const textHtml = (t) => esc(t || "").replace(/\r?\n/g, "<br>");
+// The letter's own plain text into the frame with its web addresses as links. A branded send written as plain text carries its
+// links as plain text too (an App Store address, a download page): Gmail and Apple Mail link those on their own, the hub's reader
+// and some other clients do not. Each piece between addresses is escaped exactly as textHtml does; trailing punctuation stays
+// outside the link; a bare domain is linked only with a path after it, and gets https://. Quoted originals keep textHtml, so the
+// quote rules are unchanged.
+const URL_IN_TEXT = /\bhttps?:\/\/[^\s<>"]+[^\s<>".,;:!?)\]'*]|(?<![@\w.\/-])(?:[a-z0-9-]+\.)+(?:com|net|org|io|app|dev|co\.uk|com\.au|ie|eu)\/[^\s<>"]*[^\s<>".,;:!?)\]'*]/gi;
+const linkTextHtml = (t) => {
+  const s = String(t || ""); let out = "", at = 0;
+  for (const m of s.matchAll(URL_IN_TEXT)) {
+    const href = /^https?:\/\//i.test(m[0]) ? m[0] : `https://${m[0]}`;
+    out += esc(s.slice(at, m.index)) + `<a href="${esc(href)}">${esc(m[0])}</a>`; at = m.index + m[0].length;
+  }
+  return (out + esc(s.slice(at))).replace(/\r?\n/g, "<br>");
+};
 // The quoted original as light HTML: what the mail's HTML part says, with its links, emphasis, paragraphs, breaks,
 // lists and table cells, and nothing else of its markup. A tag not in QUOTE_KEEP goes and its text stays; style, script, head, svg,
 // iframe, form, img and the like go with their contents (an img is a remote picture or a tracking pixel, and a quote must not call the
@@ -2948,7 +2971,7 @@ async function sendMail(env, body, opts = {}) {
   }
   // The letterhead: a From on a branded domain wraps the HTML part; `plain` in the body skips it.
   const brand = body.plain ? null : brandsCfg(env)[fromDomain];
-  if (brand) htmlBody = brandFrame(brand, { inner: htmlBody || textHtml(text), parent });
+  if (brand) htmlBody = brandFrame(brand, { inner: htmlBody || linkTextHtml(text), parent });
   const approxSize = attBytes + (text?.length || 0) + (htmlBody?.length || 0);
   if (approxSize > OUT_MAX_BYTES) throw new Error("message exceeds the 5 MiB limit");
   if (opts.dryRun) return sendView({ via: "hub", from, name: ident?.display_name, to, cc, bcc, subject, inReplyTo: headers["In-Reply-To"],
@@ -4296,6 +4319,16 @@ async function api(request, env, url) {
     const p = parseJsonOr((await db.prepare("SELECT mirror_progress FROM gmail_accounts WHERE email = ?").bind(acct).first())?.mirror_progress, {});
     return json({ ...head, cursor, at: now(), status, owed: [...(p.owed || []).map((o) => o.id), ...(p.todo || [])], complete: !!status && status.state === "ready" && status.owed === 0 });
   }
+  // A one-time ticket that starts Gmail connect in a browser with no hub session: the Mac and Android apps send /auth/gmail
+  // to the default browser, since Google refuses OAuth in an embedded web view, and that browser was usually never signed in to the hub,
+  // so connect stopped at "Sign in to the hub first". The ticket only starts a connect; it signs nothing in. Single use, 2 minutes.
+  if (request.method === "POST" && path === "/api/gmail/ticket") {
+    if (!gmailConfigured(env)) return json({ error: "Gmail connect is not configured" }, 503);
+    const ticket = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    await db.prepare("DELETE FROM prefs WHERE key LIKE 'gmailticket:%' AND updated_at < ?").bind(new Date(Date.now() - 600_000).toISOString()).run();
+    await db.prepare("INSERT INTO prefs (key, value, updated_at) VALUES (?, ?, ?)").bind(`gmailticket:${ticket}`, JSON.stringify({ exp: Date.now() + 120_000 }), now()).run();
+    return json({ ticket });
+  }
   if (request.method === "GET" && path === "/api/gmail/accounts") {
     const { results } = await db.prepare("SELECT email, status, scope, history_id, poll_history_id, last_poll_at, label, color, created_at, last_minted_at, last_error, watch_expiration FROM gmail_accounts ORDER BY email").all();
     return json({ accounts: results, configured: gmailConfigured(env) });
@@ -4586,8 +4619,17 @@ async function openToken(env, enc, iv, aad, purpose = "tokens") {
   return new TextDecoder().decode(pt);
 }
 const cookieValue = (request, name) => { const c = (request.headers.get("Cookie") || "").split(";").map((s) => s.trim()).find((s) => s.startsWith(name + "=")); return c ? c.slice(name.length + 1) : ""; };
+// A ticket from /api/gmail/ticket, taken (deleted) whatever happens next: true only for one that existed and had not expired.
+async function takeGmailTicket(env, ticket) {
+  if (!/^[A-Za-z0-9_-]{40,60}$/.test(ticket)) return false;
+  const row = await env.DB.prepare("DELETE FROM prefs WHERE key = ? RETURNING value").bind(`gmailticket:${ticket}`).first().catch(() => null);
+  let rec = null; try { rec = JSON.parse(row?.value || "null"); } catch (_) {}
+  return !!rec && rec.exp > Date.now();
+}
 async function gmailStart(request, env, url) {
-  if (!(await sessionValid(request, env))) return html('<p>Sign in to the hub first. <a href="/">Back</a></p>', 401);
+  const ticket = url.searchParams.get("ticket") || "";
+  const ok = (await sessionValid(request, env)) || (ticket && (await takeGmailTicket(env, ticket)));
+  if (!ok) return html(ticket ? '<p>This Connect Gmail link has expired or was already used. Go back to Sherit Mail and click Connect Gmail again.</p>' : '<p>Sign in to the hub first. <a href="/">Back</a></p>', 401, NO_SCRIPT);
   if (!gmailConfigured(env)) return html("<p>Gmail connect is not configured yet (secrets GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_TOKEN_KEY).</p>", 503);
   const nonce = uuid();
   const exp = Date.now() + 10 * 60 * 1000;
@@ -4609,7 +4651,9 @@ async function gmailCallback(request, env, url) {
   // Escaped, and no script runs on the page: Google's `error` parameter is whatever the link says, and this page is
   // on the hub's origin with the session: "?error=<img src=x onerror=…>" ran as the user.
   const fail = async (why, status = 400) => { await reserveSlot(env.DB, "gmail_connect_fail", 20, String(why).slice(0, 300)).catch(() => {}); return html(`<p>Gmail connect failed: ${esc(why)}. <a href="/">Back</a></p>`, status, NO_SCRIPT); };
-  if (!(await sessionValid(request, env))) return fail("not signed in to the hub", 401);
+  // No session is asked for here: the state below is the proof. Only gmailStart sets the mh_gmail cookie it must match, signed with
+  // the session secret, for 10 minutes, and gmailStart sets it only for a signed-in browser or a one-time ticket from a signed-in app.
+  const signedIn = await sessionValid(request, env).catch(() => false);
   if (!gmailConfigured(env)) return fail("not configured", 503);
   if (url.searchParams.get("error")) return fail(`Google returned ${url.searchParams.get("error")}`);
   const code = url.searchParams.get("code"), state = url.searchParams.get("state") || "";
@@ -4630,8 +4674,11 @@ async function gmailCallback(request, env, url) {
   const { enc, iv } = await sealToken(env, tj.refresh_token, email);
   await env.DB.prepare("INSERT INTO gmail_accounts (email, refresh_token_enc, refresh_iv, scope, status, created_at) VALUES (?, ?, ?, ?, 'active', ?) ON CONFLICT(email) DO UPDATE SET refresh_token_enc = excluded.refresh_token_enc, refresh_iv = excluded.refresh_iv, scope = excluded.scope, status = 'active', last_error = NULL").bind(email, enc, iv, tj.scope || "", now()).run();
   await logEvent(env.DB, "gmail_connected", null, `${email} ${request.headers.get("cf-connecting-ip") || ""}`);
+  const clear = "mh_gmail=; Path=/auth/gmail; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+  // A browser that came by ticket has no session: the hub's page there would only ask it to sign in, so it is told to go back to the app.
+  if (!signedIn) return html(`<p>${esc(email)} is connected. Go back to Sherit Mail; its mail shows up there in a minute or two. You can close this tab.</p>`, 200, { ...NO_SCRIPT, "set-cookie": clear });
   const h = new Headers({ location: `/?gmail=${encodeURIComponent(email)}`, "cache-control": "no-store" });
-  h.append("set-cookie", "mh_gmail=; Path=/auth/gmail; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+  h.append("set-cookie", clear);
   return new Response(null, { status: 302, headers: h });
 }
 // Daily: mint one access token per active Gmail account. A failure is logged as gmail_refresh_fail (the report flags it),
@@ -6280,7 +6327,7 @@ export async function gmailMirrorOnce(env, email) {
     if (e.status !== 404) throw e;
     // Gmail no longer has history from our cursor: rebuild from a fresh listing. Rows stay; the rebuild's gets replace them, and its
     // sweep re-checks the ones the listing no longer returns. Devices are told the account is updating meanwhile.
-    await db.prepare("UPDATE gmail_accounts SET mirror_state = 'backfill', mirror_history_id = NULL, mirror_progress = ? WHERE email = ? AND mirror_history_id IS ?").bind(JSON.stringify({ rebuild: 1 }), email, a.mirror_history_id).run();
+    await db.prepare("UPDATE gmail_accounts SET mirror_state = 'backfill', mirror_history_id = NULL, mirror_progress = ? WHERE email = ? AND mirror_history_id IS ?").bind(JSON.stringify({ rebuild: 1, pics: p.pics || [] }), email, a.mirror_history_id).run();
     await logEvent(db, "gmail_mirror_reset", null, `${email} history cursor expired; rebuilding the mirror`);
     return { a: email, mirror: "rebuild" };
   }
@@ -6308,6 +6355,7 @@ export async function gmailMirrorOnce(env, email) {
   if (t0 - (p.ru || 0) > 24 * 3600e3) { p.ru = t0; await gmailMirrorRelist(db, at, email, "labelIds=INBOX&labelIds=UNREAD", owed, goneNow, ["INBOX", "UNREAD"]); }
   const full = gmailMirrorFetched(await gmailMirrorFetch(at, p, [...owed.keys()]), owed, held, cutoff, { relabel, stubs, gone });
   p.owed = [...owed.values()];
+  if (p.pics?.length) { try { await gmailPicFill(env, at, email, p); } catch (_) {} }   // before the commit, which keeps what it took
   const wrote = await gmailMirrorCommit(db, a, { state: "ready", cursor, progress: p, synced: !page, ...gmailMirrorDedupe({ full, relabel, stubs, gone }) });
   if (!wrote) return { a: email, mirror: "another run moved the cursor first; nothing written" };
   // What arrived in Spam this run, for the poll's mention rules. Only the run that wrote hands it over, so each arrival
@@ -6347,6 +6395,41 @@ function gmailMirrorDedupe({ full, relabel, stubs, gone }) {
   const g = new Set(gone), f = new Set(full.map((x) => x.id));
   return { full: full.filter((x) => !g.has(x.id)), relabel: relabel.filter((x) => !g.has(x.id) && !f.has(x.id)), stubs: stubs.filter((x) => !g.has(x.id) && !f.has(x.id)), gone: [...g] };
 }
+// ---------- the picture fill ----------
+// A Gmail message the mirror brings in without an arrival (an account's first fill, or a rebuild after Gmail expired the cursor) never
+// had its pictures saved, and one received in the picture window (since the queue began, and in the last 90 days) is never fetched at an
+// open, so a newly connected account's recent mail showed no pictures at all. Each such mail is noted, newest first, and read in full
+// one minute's batch at a time once the mirror is ready; its pictures are queued for the cron's drain, as an arrival would have queued
+// them. The fill waits while under half of the day's picture allowance is left, so mail arriving now keeps its pictures first.
+const GMAIL_PIC_SKIP = new Set(["SPAM", "TRASH", "SENT", "DRAFT"]), GMAIL_PIC_MAX = 5000, GMAIL_PIC_PER_RUN = 10, GMAIL_PIC_MS = 8_000;
+const gmailPicSince = () => Math.max(IMG_OPEN_SINCE, Date.now() - IMG_KEEP_MS);
+// [[id, received ms]], newest first, each id once, the newest GMAIL_PIC_MAX kept.
+function gmailPicsAdd(list, add) {
+  if (!add.length) return list || [];
+  const by = new Map((list || []).map((x) => [x[0], x])); for (const x of add) by.set(x[0], x);
+  return [...by.values()].sort((a, b) => b[1] - a[1]).slice(0, GMAIL_PIC_MAX);
+}
+async function gmailPicFill(env, at, email, p) {
+  p.pics = (p.pics || []).filter((x) => x[1] >= gmailPicSince());   // past the window: fetched at an open now, nothing to save
+  if (!p.pics.length) return 0;
+  const left = await prefetchAllowance(env);
+  if (left.images < PREFETCH_DAY_IMAGES / 2 || left.bytes < PREFETCH_DAY_BYTES / 2) return 0;
+  const until = Date.now() + GMAIL_PIC_MS; let n = 0, queued = 0;
+  while (p.pics.length && n < GMAIL_PIC_PER_RUN && Date.now() < until) {
+    const id = p.pics[0][0];
+    try {
+      const m = await gmailApi(at, `messages/${encodeURIComponent(id)}?format=full`);
+      const html = (m.labelIds || []).some((l) => GMAIL_PIC_SKIP.has(l)) ? "" : gmailHtmlPart(m.payload);
+      if (html) queued += (await prefetchImages(env, html, `gmail:${email}:${id}`, { queueOnly: true, from: addrOnly(hdrVal(m, "From")) })).queued || 0;
+    } catch (e) {
+      // gone (404) is done with; another failure is tried again next minute, and a message that fails three runs running is let go
+      if (e.status !== 404 && (p.picTries = (p.picTries || 0) + 1) < 3) break;
+    }
+    p.pics.shift(); p.picTries = 0; n++;
+  }
+  if (n) await logEvent(env.DB, "gmail_pic_fill", null, `${email} read=${n} queued=${queued} left=${p.pics.length}`);
+  return n;
+}
 // The first fill, and the rebuild after Gmail expires our cursor. The cursor is taken FIRST and history is replayed from it once the
 // listing is fetched, so nothing that changes during the fill is missed. Gets share the per-minute budget; progress is durable.
 async function gmailMirrorBackfill(db, at, a) {
@@ -6374,8 +6457,12 @@ async function gmailMirrorBackfill(db, at, a) {
   const full = gmailMirrorFetched(got, todo, held, Date.now() - GMAIL_MIRROR_DAYS * 864e5, w);
   for (const id of got.found.map((m) => m.id).concat(got.gone)) todo.delete(id);
   p.todo = [...todo.keys()];
+  // Mail this fill brings in that the hub never had: its pictures were never saved, and one of the picture window is never fetched at
+  // an open, so it is noted for gmailPicFill. A rebuild's rows already held came by the poll and are not noted.
+  const picSince = gmailPicSince();
+  p.pics = gmailPicsAdd(p.pics, full.filter((x) => !held.has(x.id) && (x.d || 0) >= picSince && !x.l.some((l) => GMAIL_PIC_SKIP.has(l))).map((x) => [x.id, x.d]));
   const done = p.q >= QUERIES.length && !p.todo.length && !!p.swept;
-  const progress = done ? { owed: [], bm: p.bm, bu: p.bu } : p;
+  const progress = done ? { owed: [], bm: p.bm, bu: p.bu, pics: p.pics } : p;
   const wrote = await gmailMirrorCommit(db, a, { state: done ? "ready" : "backfill", cursor: done ? p.start : null, progress, synced: false, ...gmailMirrorDedupe({ full, ...w }) });
   if (done && wrote) await logEvent(db, "gmail_mirror_ready", null, `${email} ${p.n} listed; history replays from ${p.start}`);
   return { a: email, mirror: { backfill: true, listed: p.n, fetched: full.length, todo: p.todo.length, ready: done && !!wrote } };

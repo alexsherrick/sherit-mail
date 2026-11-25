@@ -467,6 +467,29 @@ async function sendSpeedReport(force = false) {
   try { localStorage.setItem("mh:speedAt", String(Date.now())); } catch (_) {}
   return true;
 }
+// Connect Gmail finishes in the default browser, which never reloads this app the way the old same-window callback
+// did, so the new account stayed out of the app until a relaunch. For 15 minutes after the click the app asks the hub for its Gmail
+// accounts every 10 seconds, and at once when it is looked at again; when one that was not there before appears, the app loads it.
+const gmailConnectWait = { at: 0, had: new Set(), busy: false, timer: null };
+function gmailConnectWatch() {
+  const w = gmailConnectWait; w.at = Date.now(); w.had = new Set(state.gmail.map((g) => g.email));
+  clearInterval(w.timer); w.timer = setInterval(gmailConnectBack, 10_000);
+}
+async function gmailConnectBack() {
+  const w = gmailConnectWait;
+  if (!w.at || w.busy) return;
+  const stop = () => { w.at = 0; clearInterval(w.timer); w.timer = null; };
+  if (Date.now() - w.at > 15 * 60_000) return stop();
+  w.busy = true;
+  try {
+    const added = ((await api("/api/gmail/accounts")).accounts || []).map((g) => g.email).filter((e) => !w.had.has(e));
+    if (!added.length) return;
+    stop(); await loadAccounts(); toast(`Connected ${added.join(", ")}`);
+    render(); refresh({ silent: true }); if ($("#gmailConnect")) openSettings("accounts");
+  } catch (_) {} finally { w.busy = false; }
+}
+addEventListener("focus", gmailConnectBack);
+document.addEventListener("visibilitychange", gmailConnectBack);
 async function loadAccounts() {
   const { me, g, p, pc, r, s, ps, version: bootVersion } = await bootstrapAll();
   if (bootVersion) { state.bootVersion = bootVersion; checkVersion.seed = bootVersion; }   // spent by checkVersion(): the eighth round trip, genuinely folded in
@@ -2236,7 +2259,10 @@ function spyThen(s, a, b) {
 }
 const SPY_LINEAR = SPY_TRACKERS.map(([name, rx]) => { const p = rx.source.split(/\(\.\*\)\?|\.\*\?/); return p.length === 2 && !/(^|[^\\])(\\\\)*\\$/.test(p[0]) ? [name, new RegExp(p[0], rx.flags + "g"), new RegExp(p[1], rx.flags)] : [name, rx, null]; });   // (not split after an escaping backslash)
 const spyTracker = (url) => { for (const [name, a, b] of SPY_LINEAR) if (b ? spyThen(url, a, b) : a.test(url)) return name; return null; };
-const TAG_VAL = /("([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/.source;
+// An unquoted value runs to the next HTML whitespace or `>`, as the browser reads it (WHATWG 13.2.5.38, "attribute value (unquoted)
+// state": a `=`, quote, `<` or backtick there is a parse error and is kept in the value). Stopping at `=` cut Google's
+// `src=https://…?alt=media&amp;token=…` to `…?alt`: the picture was fetched without its token, refused, and shown broken.
+const TAG_VAL = /("([^"]*)"|'([^']*)'|([^\t\n\f\r >]+))/.source;
 // Where an attribute name may begin: after whitespace, or straight after the closing quote of the attribute before it. HTML allows
 // the second (WHATWG 13.2.5.39, "after attribute value (quoted) state": anything but whitespace, / or > is a missing-whitespace-
 // between-attributes parse error and is reconsumed as the next attribute's name), and one sender's templates write every <img> that
@@ -2577,7 +2603,7 @@ function proxyImages(h, atts, found = [], t = 0) {
   // written back between double quotes, so the quote is spelled &quot; and cannot end the attribute early.) The search for the name
   // stops at the next `<` as well as the next `>` (F1): `[^>]*?` from every one of a run of unclosed `<img ` rescanned the
   // whole run, 823 ms for 40 KB of them.
-  const VAL = /("([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/.source;
+  const VAL = TAG_VAL;
   const attr = (name, fn, tags = "img|td|th|table|body|div") => { h = h.replace(new RegExp("(<(?:" + tags + ")\\b[^<>]*?" + ATTR_AT + name + "\\s*=\\s*)" + VAL, "gi"), (m0, pre, q, a, b, c) => pre + '"' + fn(a !== undefined ? a : b !== undefined ? b : c) + '"'); };
   attr("src", (v) => px(v));
   attr("background", (v) => px(v));
@@ -4920,7 +4946,7 @@ async function openSettings(want) {
         state.me.identities.map((i) => `<div class="st-row st-acct"><div class="st-rl">${sAvatar(i.email, "var(--acc)")}<div><div class="st-rt">${esc(i.email)}</div><div class="st-hint">Your domain${i.display_name ? " · sends as " + esc(i.display_name) : ""}</div></div></div></div>`).join("")
         + state.gmail.map((g) => `<div class="st-row st-acct"><div class="st-rl">${sAvatar(acctNames()[g.email] || g.label || g.email, acctColors()[g.email] || g.color || colorFor(g.email))}<div style="min-width:0"><div class="st-rt">${esc(g.email)}</div><div class="st-hint">Gmail${g.status !== "active" ? ` · <span style="color:var(--danger)">${esc(g.status)}</span>` : ""}</div></div></div><div class="st-rc"><button class="ghost st-danger" data-goff="${esc(g.email)}">Disconnect</button></div></div>`).join("")
         + imapAcctsAll().map((a) => `<div class="st-row st-acct"><div class="st-rl">${sAvatar(acctNames()[a.email] || a.label || a.email, acctColors()[a.email] || a.color || colorFor(a.email))}<div style="min-width:0"><div class="st-rt">${esc(a.email)}</div><div class="st-hint">Work mailbox${a.host ? " · " + esc(a.host) : ""} · ${imapStatusHtml(a)}</div></div></div><div class="st-rc"><button data-iedit="${esc(a.email)}"${a.ready ? "" : ' class="primary"'}>${a.ready ? "Change password" : "Add password"}</button>${a.source === "app" ? `<button class="ghost st-danger" data-idel="${esc(a.email)}">Remove</button>` : ""}</div></div>`).join(""),
-        { hint: "The addresses this app reads and sends from. Names and colours are set under Sidebar.", action: `<span style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">${state.gmailConfigured ? '<a href="/auth/gmail" style="text-decoration:none"><button class="primary">Connect Gmail</button></a>' : ""}<button id="imapAdd">Add work account</button></span>` })
+        { hint: "The addresses this app reads and sends from. Names and colours are set under Sidebar.", action: `<span style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">${state.gmailConfigured ? '<a id="gmailConnect" href="/auth/gmail" style="text-decoration:none"><button class="primary">Connect Gmail</button></a>' : ""}<button id="imapAdd">Add work account</button></span>` })
       + (state.gmailConfigured ? "" : sGroup("", sRow("Gmail connect is not configured on the Worker")))
       + sGroup("Sign out", sRow("Sign out of this device", '<button id="signout">Sign out</button>', "Mail cached here is wiped.") + sRow("Sign out everywhere", '<button id="signoutall" class="st-danger">Sign out everywhere</button>', "Every browser and phone has to sign in again, and this device is wiped.")),
     general: sGroup("Writing", sRow("Compose in", sel("composemode", [["text", "Plain text"], ["markdown", "Markdown (sent as text + HTML)"]], composeMode()), "", "wide"))
@@ -5053,6 +5079,14 @@ async function openSettings(want) {
   // the row's glyph and the picker's icon follow the choice at once, in the colour that swipe will show
   const paintSwipeSlots = () => { for (const [id, , , , right, long] of SWIPE_SLOTS) { const el = $("#" + id); const a = el.value; const c = swipeColor(a, right, long); const row = el.closest(".st-row"); row.querySelector(".st-swg").outerHTML = swipeGlyph(right, long, c); const pick = el.closest(".st-pick"); pick.style.setProperty("--c", c); pick.querySelector("svg.i").outerHTML = ico(ACTION_ICONS[a] || "close"); } };
   if ($("#imapAdd")) $("#imapAdd").onclick = () => openImapForm();
+  // Connect Gmail carries a one-time ticket: the native apps open it in the default browser, which has no hub session. Without a
+  // ticket (the request failed) it is the plain link, which still works where the browser is signed in.
+  if ($("#gmailConnect")) $("#gmailConnect").onclick = async (e) => {
+    e.preventDefault(); let t = "";
+    try { t = (await api("/api/gmail/ticket", { method: "POST" })).ticket || ""; } catch (_) {}
+    gmailConnectWatch();
+    location.href = "/auth/gmail" + (t ? "?ticket=" + encodeURIComponent(t) : "");
+  };
   $$("[data-iedit]").forEach((b) => b.onclick = () => openImapForm(imapAcctsAll().find((a) => a.email === b.dataset.iedit) || { email: b.dataset.iedit }));
   $$("[data-idel]").forEach((b) => b.onclick = async () => { const em = b.dataset.idel; if (!(await ask(`Remove ${em}? Its mail stays in the app. The hub deletes the saved password and stops syncing it.`, { ok: "Remove", danger: true }))) return; try { await api(`/api/imap/accounts/${encodeURIComponent(em)}`, { method: "DELETE" }); await loadAccounts(); render(); toast("Removed " + em); openSettings("accounts"); } catch (e) { toast(e.message); } });
   $("#swr").onchange = $("#swl").onchange = $("#swrl").onchange = $("#swll").onchange = () => { paintSwipeSlots(); const sw = { right: $("#swr").value, rightLong: $("#swrl").value, left: $("#swl").value, leftLong: $("#swll").value }; api("/api/prefs", { method: "PUT", body: JSON.stringify({ swipes: sw }) }).then(() => { state.prefs.swipes = sw; render(); }); };

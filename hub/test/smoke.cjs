@@ -244,6 +244,13 @@ w.addEventListener("error", (e) => errors.push("window error: " + (e.error?.stac
     console.log("proxyImages bare attrs:", JSON.stringify({ bare, quoted, bg, set, data, cid, rawLeft: raw }));
     check(bare && quoted && bg && set && data && cid && !raw, "bare src/background/srcset rewritten, data and cid preserved");
   }
+  { // a bare value runs to the next whitespace or `>`, `=` and all, as the browser reads it: Google's footer icons are
+    // `src=https://…?alt=media&amp;token=…`, which was proxied as `…?alt` with `=media&amp;token=…` left over as junk in the tag
+    const out = w.mh.proxyImages('<img src=https://store.example/o/i%2Fgh?alt=media&amp;token=16c3 alt="Visit us" width=33>');
+    const whole = out.includes('src="/api/img?u=' + encodeURIComponent("https://store.example/o/i%2Fgh?alt=media&token=16c3") + '" alt="Visit us" width=33>'), junk = /=media|token=16c3[^"]/.test(out.replace(/src="[^"]*"/, ""));
+    console.log("proxyImages bare value with '=':", JSON.stringify({ whole, junk }));
+    check(whole && !junk, "a bare src holding '=' is proxied whole, nothing left over in the tag");
+  }
   { // the attribute is entity-encoded HTML: the proxied URL is the DECODED one (Venmo's resizer 502s on a literal `amp;height`), and a
     // value written back unproxied keeps its entities, so a decoded quote cannot close the attribute
     const out = w.mh.proxyImages('<img src="https://pics-v3.venmo.com/x?width=100&amp;height=100&#38;v=1"><img srcset="https://a.b/1.png?a=1&amp;b=2 1x"><img src="data:image/svg+xml,&quot; onerror=&quot;x">');
