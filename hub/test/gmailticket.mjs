@@ -77,7 +77,7 @@ const start = await call("/auth/gmail?ticket=" + encodeURIComponent(ticket));
 const state = stateOf(start);
 check(toGoogle(start) && state.split(".").length === 3, `with the ticket, a browser with no session is sent to Google with a state cookie (${start.status} ${(start.headers.get("location") || "").slice(0, 40)})`);
 const again = await call("/auth/gmail?ticket=" + encodeURIComponent(ticket));
-check(again.status === 401 && !toGoogle(again) && /already used/.test(await again.text()), `the same ticket again is refused (${again.status})`);
+check(again.status === 401 && !toGoogle(again) && /This link has expired/.test(await again.text()), `the same ticket again is refused (${again.status})`);
 const madeUp = await call("/auth/gmail?ticket=" + "A".repeat(43));
 check(madeUp.status === 401 && !toGoogle(madeUp), `a made-up ticket is refused (${madeUp.status})`);
 const old = "B".repeat(43);
@@ -96,7 +96,14 @@ check(wrong.status === 400 && !sq.prepare("SELECT 1 FROM gmail_accounts WHERE em
 const cb = await call(`/auth/gmail/callback?code=c&state=${encodeURIComponent(state)}`, { cookie: `mh_gmail=${state}` });
 const page = await cb.text(), row = sq.prepare("SELECT email, status FROM gmail_accounts WHERE email = ?").get(E);
 check(cb.status === 200 && row && row.status === "active", `the callback in that browser connects ${E} (${cb.status}, ${row ? row.status : "no row"})`);
-check(/is connected\. Go back to Sherit Mail/.test(page) && /default-src 'none'/.test(cb.headers.get("content-security-policy") || "") && /mh_gmail=;/.test(cb.headers.get("set-cookie") || ""), `and says so on a page with no script, clearing the state cookie`);
+check(/<h1>Gmail connected<\/h1>/.test(page) && page.includes(`<p class="pill">${E}</p>`) && /Head back to Sherit Mail/.test(page) && /mh_gmail=;/.test(cb.headers.get("set-cookie") || ""), `and says so, naming the account, clearing the state cookie`);
+// The connect pages carry the app's look and still run nothing: one stylesheet allowed by its hash, the hub's own images, no script.
+{
+  const csp = cb.headers.get("content-security-policy") || "", css = (/<style>([\s\S]*?)<\/style>/.exec(page) || [])[1] || "";
+  const hash = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(css))).toString("base64");
+  check(/default-src 'none'/.test(csp) && !/script-src|unsafe-inline|unsafe-eval/.test(csp) && csp.includes(`style-src 'sha256-${hash}'`) && /img-src 'self'/.test(csp), `the page's CSP: nothing by default, its own stylesheet by hash, the hub's images, no script (${csp})`);
+  check(!/<script|\son[a-z]+=|style="/i.test(page) && page.includes('<img src="/icons/icon-512.png"'), `and the page has no script, no handler, no inline style; the ghost is the hub's own icon`);
+}
 google.nonce = stateOf(signedStart).split(".")[1];
 const cb2 = await call(`/auth/gmail/callback?code=c&state=${encodeURIComponent(stateOf(signedStart))}`, { cookie: `${SESSION}; mh_gmail=${stateOf(signedStart)}` });
 check(cb2.status === 302 && (cb2.headers.get("location") || "").startsWith("/?gmail="), `a signed-in browser is sent back to the app, as before (${cb2.status} ${cb2.headers.get("location")})`);

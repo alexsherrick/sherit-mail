@@ -4619,6 +4619,45 @@ async function openToken(env, enc, iv, aad, purpose = "tokens") {
   return new TextDecoder().decode(pt);
 }
 const cookieValue = (request, name) => { const c = (request.headers.get("Cookie") || "").split(";").map((s) => s.trim()).find((s) => s.startsWith(name + "=")); return c ? c.slice(name.length + 1) : ""; };
+// The pages a browser lands on around Connect Gmail: connected, cancelled, expired, failed, or not signed in. They are often the
+// only part of the app a default browser ever shows (the native apps hand connect to it), so they carry the app's look: the ghost,
+// a badge for how it went, the app's colours light and dark. Still no script runs: the CSP allows this one stylesheet by its hash and
+// the hub's own images, nothing else, and every piece of text is escaped (an `error` from the link is whatever the link says).
+const CONNECT_CSS = ':root{color-scheme:light dark;--bg:#eef0f6;--card:#fff;--fg:#15161a;--mut:#6b6f7c;--line:#e3e5ec;--acc:#3b5bdb;--ok:#1f9d55;--no:#e8710a}'
+  + '@media(prefers-color-scheme:dark){:root{--bg:#0c0f1d;--card:#151a2c;--fg:#ececf1;--mut:#9aa0ab;--line:#252b42;--acc:#7c93ff;--ok:#34c77b;--no:#ff9f43}}'
+  + '*{box-sizing:border-box}html,body{height:100%}'
+  + 'body{margin:0;display:grid;place-items:center;padding:24px 16px;color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;'
+  + 'background:radial-gradient(900px 520px at 50% -8%,color-mix(in srgb,var(--acc) 24%,transparent),transparent 62%),var(--bg)}'
+  + '.card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);border-radius:22px;padding:40px 28px 30px;text-align:center;box-shadow:0 24px 70px rgba(8,12,40,.22)}'
+  + '.art{position:relative;width:112px;height:112px;margin:0 auto 22px;animation:float 3.4s ease-in-out infinite}'
+  + '.art img{display:block;width:112px;height:112px;border-radius:26px;image-rendering:pixelated;box-shadow:0 12px 34px color-mix(in srgb,var(--acc) 40%,transparent)}'
+  + '.badge{position:absolute;right:-10px;bottom:-10px;width:42px;height:42px;border-radius:50%;display:grid;place-items:center;border:4px solid var(--card);animation:pop .5s cubic-bezier(.2,1.6,.4,1) .2s both}'
+  + '.ok .badge{background:var(--ok)}.no .badge{background:var(--no)}.badge svg{width:20px;height:20px}'
+  + '.ok .art::before,.ok .art::after{content:"";position:absolute;width:6px;height:6px;animation:twinkle 1.9s ease-in-out infinite}'
+  + '.ok .art::before{left:-24px;top:16px;background:var(--acc);box-shadow:0 -6px var(--acc),0 6px var(--acc),-6px 0 var(--acc),6px 0 var(--acc)}'
+  + '.ok .art::after{right:-20px;top:-8px;animation-delay:.95s;background:var(--ok);box-shadow:0 -6px var(--ok),0 6px var(--ok),-6px 0 var(--ok),6px 0 var(--ok)}'
+  + 'h1{margin:0 0 10px;font-size:23px;line-height:1.25;letter-spacing:-.01em}p{margin:0 0 14px;color:var(--mut)}'
+  + '.pill{display:inline-block;max-width:100%;margin:0 0 16px;padding:6px 14px;border-radius:999px;background:color-mix(in srgb,var(--acc) 13%,transparent);color:var(--fg);font-weight:600;overflow-wrap:anywhere}'
+  + '.btn{display:inline-block;margin-top:6px;padding:10px 20px;border-radius:11px;background:var(--acc);color:#fff;text-decoration:none;font-weight:600}'
+  + '.note{margin:20px 0 0;font-size:13px}'
+  + '@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}@keyframes pop{from{transform:scale(0)}to{transform:scale(1)}}'
+  + '@keyframes twinkle{0%,100%{opacity:0;transform:scale(.5)}50%{opacity:1;transform:scale(1)}}'
+  + '@media(prefers-reduced-motion:reduce){.art,.badge,.ok .art::before,.ok .art::after{animation:none}}';
+const CONNECT_BADGE = {
+  ok: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 10.5l3.5 3.5 7.5-8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  no: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.5v7" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/><circle cx="10" cy="15.2" r="1.7" fill="#fff"/></svg>',
+};
+let connectCspP = null;
+const connectCsp = () => (connectCspP ||= crypto.subtle.digest("SHA-256", new TextEncoder().encode(CONNECT_CSS))
+  .then((d) => `default-src 'none'; style-src 'sha256-${btoa(String.fromCharCode(...new Uint8Array(d)))}'; img-src 'self'; base-uri 'none'; form-action 'none'`));
+// `ok` picks the badge; `pill` is shown highlighted (the address connected); every string is plain text, escaped here.
+async function connectPage({ ok = false, title, pill = "", text = "", note = "", link = null }, status = 200, extra = {}) {
+  const body = `<main class="card ${ok ? "ok" : "no"}"><div class="art"><img src="/icons/icon-512.png" alt="" width="112" height="112"><span class="badge">${CONNECT_BADGE[ok ? "ok" : "no"]}</span></div>`
+    + `<h1>${esc(title)}</h1>${pill ? `<p class="pill">${esc(pill)}</p>` : ""}${text ? `<p>${esc(text)}</p>` : ""}`
+    + `${link ? `<a class="btn" href="${esc(link.href)}">${esc(link.text)}</a>` : ""}${note ? `<p class="note">${esc(note)}</p>` : ""}</main>`;
+  return html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · Sherit Mail</title><style>${CONNECT_CSS}</style></head><body>${body}</body></html>`,
+    status, { "content-security-policy": await connectCsp(), ...extra });
+}
 // A ticket from /api/gmail/ticket, taken (deleted) whatever happens next: true only for one that existed and had not expired.
 async function takeGmailTicket(env, ticket) {
   if (!/^[A-Za-z0-9_-]{40,60}$/.test(ticket)) return false;
@@ -4629,8 +4668,10 @@ async function takeGmailTicket(env, ticket) {
 async function gmailStart(request, env, url) {
   const ticket = url.searchParams.get("ticket") || "";
   const ok = (await sessionValid(request, env)) || (ticket && (await takeGmailTicket(env, ticket)));
-  if (!ok) return html(ticket ? '<p>This Connect Gmail link has expired or was already used. Go back to Sherit Mail and click Connect Gmail again.</p>' : '<p>Sign in to the hub first. <a href="/">Back</a></p>', 401, NO_SCRIPT);
-  if (!gmailConfigured(env)) return html("<p>Gmail connect is not configured yet (secrets GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_TOKEN_KEY).</p>", 503);
+  if (!ok) return connectPage(ticket
+    ? { title: "This link has expired", text: "A Connect Gmail link works once, for two minutes. Go back to Sherit Mail and click Connect Gmail again." }
+    : { title: "Sign in to the hub first", text: "Connect Gmail from Settings in Sherit Mail, or sign in here first.", link: { href: "/", text: "Sign in" } }, 401);
+  if (!gmailConfigured(env)) return connectPage({ title: "Gmail connect isn't set up", text: "The hub needs the secrets GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET and GMAIL_TOKEN_KEY." }, 503);
   const nonce = uuid();
   const exp = Date.now() + 10 * 60 * 1000;
   const state = `${exp}.${nonce}.${await hmac(env.SESSION_SECRET, `gmail.${exp}.${nonce}`)}`;
@@ -4650,7 +4691,12 @@ async function gmailStart(request, env, url) {
 async function gmailCallback(request, env, url) {
   // Escaped, and no script runs on the page: Google's `error` parameter is whatever the link says, and this page is
   // on the hub's origin with the session: "?error=<img src=x onerror=…>" ran as the user.
-  const fail = async (why, status = 400) => { await reserveSlot(env.DB, "gmail_connect_fail", 20, String(why).slice(0, 300)).catch(() => {}); return html(`<p>Gmail connect failed: ${esc(why)}. <a href="/">Back</a></p>`, status, NO_SCRIPT); };
+  const fail = async (why, status = 400) => {
+    await reserveSlot(env.DB, "gmail_connect_fail", 20, String(why).slice(0, 300)).catch(() => {});
+    if (why === "Google returned access_denied") return connectPage({ title: "Connect cancelled", text: "Nothing was connected. Go back to Sherit Mail to try again, or close this tab." }, status);
+    const w = String(why);
+    return connectPage({ title: "Couldn't connect Gmail", text: w.charAt(0).toUpperCase() + w.slice(1) + ".", note: "Go back to Sherit Mail and click Connect Gmail again." }, status);
+  };
   // No session is asked for here: the state below is the proof. Only gmailStart sets the mh_gmail cookie it must match, signed with
   // the session secret, for 10 minutes, and gmailStart sets it only for a signed-in browser or a one-time ticket from a signed-in app.
   const signedIn = await sessionValid(request, env).catch(() => false);
@@ -4676,7 +4722,7 @@ async function gmailCallback(request, env, url) {
   await logEvent(env.DB, "gmail_connected", null, `${email} ${request.headers.get("cf-connecting-ip") || ""}`);
   const clear = "mh_gmail=; Path=/auth/gmail; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
   // A browser that came by ticket has no session: the hub's page there would only ask it to sign in, so it is told to go back to the app.
-  if (!signedIn) return html(`<p>${esc(email)} is connected. Go back to Sherit Mail; its mail shows up there in a minute or two. You can close this tab.</p>`, 200, { ...NO_SCRIPT, "set-cookie": clear });
+  if (!signedIn) return connectPage({ ok: true, title: "Gmail connected", pill: email, text: "Head back to Sherit Mail. Its mail shows up there in a minute or two.", note: "You can close this tab." }, 200, { "set-cookie": clear });
   const h = new Headers({ location: `/?gmail=${encodeURIComponent(email)}`, "cache-control": "no-store" });
   h.append("set-cookie", clear);
   return new Response(null, { status: 302, headers: h });

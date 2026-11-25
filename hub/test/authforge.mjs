@@ -82,8 +82,10 @@ const r = await get(`/auth/gmail/callback?error=${encodeURIComponent(evil)}`, { 
 const body = await r.text(), csp = r.headers.get("content-security-policy") || "";
 if (CONTROL) check(body.includes(evil), `CONTROL — … and writes the error parameter's markup into the page (${r.status})`);
 else {
-  check(!body.includes("<img") && body.includes("&lt;img src=x onerror=alert(document.domain)&gt;"), `the Gmail-connect error page escapes the error parameter (${body.slice(0, 120)})`);
-  check(/default-src 'none'/.test(csp), `… and runs no script (${csp})`);
+  // The page shows the app's ghost, so it has one <img>: the hub's own icon, and never the parameter's.
+  const imgs = body.match(/<img\b[^>]*>/g) || [];
+  check(!body.includes(evil) && imgs.length === 1 && imgs[0].startsWith('<img src="/icons/icon-512.png"') && body.includes("&lt;img src=x onerror=alert(document.domain)&gt;"), `the Gmail-connect error page escapes the error parameter (${imgs.length} img; ${body.slice(body.indexOf("<h1>"), body.indexOf("<h1>") + 160)})`);
+  check(/default-src 'none'/.test(csp) && !/script-src|unsafe-inline|unsafe-eval/.test(csp), `… and runs no script (${csp})`);
 }
 console.log(fails.length ? `${fails.length} failed` : "all auth checks passed");
 process.exit(fails.length ? 1 : 0);
