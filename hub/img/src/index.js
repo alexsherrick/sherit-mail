@@ -8,7 +8,7 @@
 // written the original is deleted (the phone falls back to the desktop size); a picture neither size helps keeps its original.
 import SHRINK_WASM from "../wasm/shrink.wasm";
 
-export const IMG = { widths: [1600, 1080], quality: 82, methodStill: 4, methodAnim: 2, keepUnder: 0.8, batch: 12, batchMs: 25_000, staleMs: 10 * 60_000,
+export const IMG = { widths: [1600, 1080], quality: 82, methodStill: 4, methodAnim: 2, methodLean: 2, keepUnder: 0.8, batch: 12, batchMs: 25_000, staleMs: 10 * 60_000,
   maxTries: 3, maxPx: 20_000_000, maxFrames: 2000, reuse: 25, maxBytes: 16 * 1024 * 1024 };
 const RC = ["ok", "keep", "unsupported", "too big", "bad", "no memory"];
 const now = () => new Date().toISOString();
@@ -80,12 +80,23 @@ export async function shrinkOne(env, row, r) {
     }
     if ((obj.size || 0) > IMG.maxBytes) { await mark("skipped", { note: `over ${IMG.maxBytes} bytes` }); r.skipped++; return; }
     const buf = new Uint8Array(await obj.arrayBuffer()), was = obj.httpMetadata?.contentType || "";
-    const method = isGif(buf) ? IMG.methodAnim : IMG.methodStill, notes = [], kept = {};
+    // Out of memory: a picture with transparency can need more than the module's 88 MiB at the desktop size, since
+    // libwebp packs the alpha plane with its lossless coder at the picture's effort (2 of 1,220 pictures by 2026-11-26, both PNGs: a
+    // 2,000 x 2,000 fits at effort 3 in 55 MiB, a 1,766 x 4,096 at 1,600 px fits at none, though its 1,080 px size does). Such a picture
+    // is not given up: the next minute tries it at effort 2 ("lean:"), then, if the desktop size still does not fit, makes the phone size
+    // alone ("lean: phone"), the original staying for the desktop. This run, having dropped a grown instance, takes nothing more.
+    const lean = /^lean/.test(row.note || ""), phoneOnly = /^lean: phone/.test(row.note || "");
+    const method = isGif(buf) ? IMG.methodAnim : lean ? IMG.methodLean : IMG.methodStill, notes = [], kept = {};
     let inW = 0;
     for (const W of IMG.widths) {
+      if (W === 1600 && phoneOnly) { notes.push(`1600: no memory at effort ${IMG.methodLean} (the original stays for the desktop)`); continue; }
       if (W === 1080 && inW && inW <= 1080) break;   // no wider than the phone: the desktop size serves both
       if (bigDrops !== r.drops0) { notes.push(`${W}: skipped (a big instance was dropped in this run; the phone takes the desktop size)`); break; }
       const res = shrinkBytes(buf, W, method); inW = res.inW || inW;
+      if (res.rc === "no memory" && !isGif(buf) && !(lean && (W === 1080 || phoneOnly))) {
+        await mark("pending", { note: lean ? `lean: phone size only (${W}: no memory at effort ${method})` : `lean: ${W}: no memory at effort ${method}; again at effort ${IMG.methodLean}` });
+        r.retried++; return;
+      }
       if (res.rc !== "ok") { notes.push(`${W}: ${res.rc}${res.note ? " (" + res.note + ")" : ""}`); if (W === 1600 && res.rc !== "keep") break; continue; }
       if (!isWebp(res.out)) { notes.push(`${W}: not a WebP`); continue; }
       if (res.out.byteLength >= buf.byteLength * IMG.keepUnder) { notes.push(`${W}: ${res.out.byteLength} not under 80 % of ${buf.byteLength}`); continue; }
@@ -111,13 +122,13 @@ export async function shrinkOne(env, row, r) {
 
 // The cron: claims of crashed runs taken back, then the newest waiting pictures, each claimed before it is shrunk.
 export async function tick(env) {
-  const db = env.DB, t0 = Date.now(), r = { n: 0, done: 0, skipped: 0, failed: 0, before: 0, after: 0, drops0: bigDrops };
+  const db = env.DB, t0 = Date.now(), r = { n: 0, done: 0, skipped: 0, failed: 0, retried: 0, before: 0, after: 0, drops0: bigDrops };
   // A claim older than ten minutes was a run killed past its CPU or memory limit (or one still running past any sane time): it counts as
   // a try, so a picture that kills every run gives up after three instead of being taken back for ever.
   await db.prepare("UPDATE img_work SET tries = tries + 1, state = CASE WHEN tries + 1 >= ? THEN 'failed' ELSE 'pending' END, note = 'claim taken back: the run that had it ended without a word', done_at = CASE WHEN tries + 1 >= ? THEN ? ELSE NULL END, claimed_at = NULL WHERE state = 'working' AND claimed_at < ?")
     .bind(IMG.maxTries, IMG.maxTries, now(), new Date(Date.now() - IMG.staleMs).toISOString()).run();
   // Fewest tries first: a picture whose run was killed waits behind the ones never tried, so it cannot be claimed first by every tick.
-  const rows = (await db.prepare("SELECT key, bytes, tries, dom FROM img_work WHERE state = 'pending' ORDER BY tries, at DESC LIMIT ?").bind(IMG.batch).all()).results || [];
+  const rows = (await db.prepare("SELECT key, bytes, tries, dom, note FROM img_work WHERE state = 'pending' ORDER BY tries, at DESC LIMIT ?").bind(IMG.batch).all()).results || [];
   for (const row of rows) {
     if (Date.now() - t0 > IMG.batchMs || bigDrops !== r.drops0) break;
     const token = now() + "#" + crypto.randomUUID().slice(0, 8);   // sorts by time; unique per claim
@@ -125,7 +136,7 @@ export async function tick(env) {
     if (!claim.meta?.changes) continue;   // another tick took it
     r.n++; await shrinkOne(env, { ...row, claim: token }, r);
   }
-  if (r.n) await db.prepare("INSERT INTO events (kind, detail) VALUES ('img_shrink', ?)").bind(`n=${r.n} done=${r.done} skipped=${r.skipped} failed=${r.failed} before=${r.before} after=${r.after} ms=${Date.now() - t0}`).run();
+  if (r.n) await db.prepare("INSERT INTO events (kind, detail) VALUES ('img_shrink', ?)").bind(`n=${r.n} done=${r.done} skipped=${r.skipped} failed=${r.failed}${r.retried ? ` lean=${r.retried}` : ""} before=${r.before} after=${r.after} ms=${Date.now() - t0}`).run();
   return r;
 }
 

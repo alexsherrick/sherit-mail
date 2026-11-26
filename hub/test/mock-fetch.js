@@ -22,7 +22,8 @@
     },
     "GET /api/me": { identities: [{ email: "sam@yourdomain.example", display_name: "Sam", domain: "yourdomain.example" }], forward_to: "x" },
     "GET /api/imgdims?": { seq: 0, days: {}, more: false },
-    "GET /api/img?": { __status: 204 },   // the app's own warm-ups of pictures; a frame's <img> never comes through fetch // picture sizes; test/imgdims.py fills its own
+    "GET /api/img?": { __status: 204 },
+    "GET /api/fontcss?": { __text: "/* not kept */" },   // a mail's font stylesheet as the hub kept it; __text: answered as written // the app's own warm-ups of pictures; a frame's <img> never comes through fetch // picture sizes; test/imgdims.py fills its own
     "GET /api/trackers?": { seq: 0, rows: [], more: false },   // the hub's blocks beyond the named list; test/trackers.mjs fills its own
     "GET /api/trackers/status": { learner: { mode: "watch", since: "2026-11-10T00:00:00.000Z" }, on_at: "2026-11-24T00:00:00.000Z", rules: [], recent: [], lists: [], day: { blocked: 0, slipped: 0 } },
     "GET /api/gmail/accounts": { accounts: [{ email: "sam.owner.sxsw@gmail.com", status: "active", label: "SXSW", color: "#aa3366" }], configured: true },
@@ -113,7 +114,8 @@
     if (!hit) { if (!/batch\/gmail/.test(key)) errors.push("UNMOCKED " + key); return { ok: false, status: 404, json: async () => ({ error: "unmocked " + key }), text: async () => "", headers: new Map() }; }
     if (hit && hit.__b64 !== undefined) { const bin = atob(hit.__b64); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); return { ok: true, status: 200, arrayBuffer: async () => u8.buffer.slice(0), text: async () => bin, json: async () => { throw new Error("not JSON"); }, headers: new Map() }; } // raw bytes (attachments)
     if (hit && hit.__status) return { ok: false, status: hit.__status, json: async () => JSON.parse(JSON.stringify(hit)), text: async () => JSON.stringify(hit), headers: new Map() }; // a route that answers with an error status
-    return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(hit)), text: async () => JSON.stringify(hit), headers: new Map() };
+    return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(hit)), text: async () => (hit && typeof hit.__text === "string" ? hit.__text : JSON.stringify(hit)), headers: new Map(),
+      arrayBuffer: async () => (hit && typeof hit.__b64 === "string" ? Uint8Array.from(atob(hit.__b64), (c) => c.charCodeAt(0)).buffer : new TextEncoder().encode(JSON.stringify(hit)).buffer) };   // __b64: a file's bytes
   };
 })();
 // Test-only: how a test waits until the page is quiet instead of for a fixed time. Counted here, before app.js

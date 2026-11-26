@@ -13,7 +13,7 @@ mod imp {
     use crate::core::{AUMID, REG_APP};
     use std::path::Path;
     use webview2_com::Microsoft::Web::WebView2::Win32::*;
-    use webview2_com::{take_pwstr, ContextMenuRequestedEventHandler, ProcessFailedEventHandler};
+    use webview2_com::{take_pwstr, ContextMenuRequestedEventHandler, DOMContentLoadedEventHandler, ProcessFailedEventHandler};
     use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
@@ -267,6 +267,18 @@ mod imp {
             let Ok(core) = controller.CoreWebView2() else { return };
             if let Ok(s) = core.Settings().and_then(|s| s.cast::<ICoreWebView2Settings4>()) {
                 let _ = s.SetIsPasswordAutosaveEnabled(false);
+            }
+            crate::launch_mark("webview tuned");
+            // The page's DOMContentLoaded, as WebView2 sees it, in the navigation's own clock.
+            if let Ok(c2) = core.cast::<ICoreWebView2_2>() {
+                let mut token = 0i64;
+                let _ = c2.add_DOMContentLoaded(
+                    &DOMContentLoadedEventHandler::create(Box::new(|_, _| {
+                        crate::nav_mark("DOMContentLoaded", false);
+                        Ok(())
+                    })),
+                    &mut token,
+                );
             }
             if let Ok(c11) = core.cast::<ICoreWebView2_11>() {
                 let mut token = 0i64;

@@ -129,7 +129,7 @@ w.addEventListener("error", (e) => errors.push("window error: " + (e.error?.stac
     const bad = cases.filter(([n, b, want]) => sniff(b) !== want); console.log("sniffImage:", cases.length - bad.length, "/", cases.length, "cases", bad.length ? "FAILED " + bad.map(([n, b]) => n + "=" + sniff(b)).join(",") : "");
     check(!bad.length, "sniffImage cases");
     // HubSpot's CTA images answer 406 to an Accept with no */*; the proxy asks the way browsers do.
-    const acc = (src.match(/async function fetchImageSafely[\s\S]*?"Accept": "([^"]+)"/) || [])[1] || "";
+    const acc = (src.match(/const IMG_ACCEPT = "([^"]+)"/) || [])[1] || "";   // fetchImageSafely's, named since fonts ask with their own
     check(/(^|,)\*\/\*(;q=[\d.]+)?$/.test(acc), `the image proxy's Accept ends in */*, like a browser's (${acc})`);
   }
 

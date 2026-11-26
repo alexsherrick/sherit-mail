@@ -8,6 +8,13 @@ function dropTagBlocks(s, names) {
   while ((m = re.exec(s))) { const n = m[1].toLowerCase(); if (dead.has(n)) continue; const k = lower.indexOf("</" + n + ">", m.index + m[0].length); if (k < 0) { dead.add(n); continue; } out += s.slice(at, m.index) + " "; at = k + n.length + 3; re.lastIndex = at; }
   return at ? out + s.slice(at) : s;
 }
+// The words of a mail's HTML as the search index keeps them, and as a search's preview line shows them. The tags went
+// but their entities stayed and its comments' contents were read as words: a newsletter built for Outlook opens with
+// <!--[if mso]>... <o:PixelsPerInch>96</o:PixelsPerInch>... <![endif]--> and <!--<![endif]-->, which a search for it previewed as
+// "&lt;!-- 96 &lt;!-- Join us at...". The page has dropped the comments already (tagSafeMsg); what is left is decoded.
+const INDEX_ENT = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+const indexText = (html) => dropTagBlocks(html || "", "style|script|head|title").replace(/<[^<>]+>/g, " ")
+  .replace(/&(#x[0-9a-f]{1,6}|#\d{1,7}|[a-z]{2,6});/gi, (m0, e) => { if (e[0] !== "#") return INDEX_ENT[e.toLowerCase()] ?? m0; const n = /^#x/i.test(e) ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10); return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : m0; });
 const searchIndex = {
   worker: null, seq: 0, waiting: new Map(), status: { mode: "none", indexed: 0, ready: false, error: null }, lastIndexedAt: 0, pendingRows: new Map(), flushTimer: null,
   start() {
@@ -33,7 +40,7 @@ const searchIndex = {
     this.status.ready = !this.status.error;
   },
   indexThreads(threads) { if (!this.worker) return; this.queue(threads.map((t) => this.rowFor(t))); },
-  indexBodies(t, messages) { if (!this.worker) return; const text = messages.map((m) => (m.text || dropTagBlocks(m.html || "", "style|script").replace(/<[^<>]+>/g, " ")).replace(/\s+/g, " ")).join("\n").slice(0, 200000); this.queue([this.rowFor(t, text)]); },
+  indexBodies(t, messages) { if (!this.worker) return; const text = messages.map((m) => (m.text || indexText(m.html)).replace(/\s+/g, " ")).join("\n").slice(0, 200000); this.queue([this.rowFor(t, text)]); },
   remove(keys) { if (this.worker && keys.length) this.call("remove", { keys }).catch(() => {}); },
   async query(q, opts = {}) { if (!this.worker || !this.status.ready) return null; try { const r = await this.call("search", { q, limit: opts.limit || 200, opts }); return r.rows; } catch (e) { this.status.error = e.message; return null; } },
   async rebuild(threads) { if (!this.worker) return; try { await this.call("clear"); } catch (_) {} this.lastIndexedAt = 0; this.indexThreads(threads); await this.flush(); },

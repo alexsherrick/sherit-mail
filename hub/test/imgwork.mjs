@@ -8,8 +8,11 @@
 //  - two ticks at once take each picture once (the claim); a claim left by a crashed run is taken back after ten minutes;
 //  - the instance is reused across pictures and gives the same bytes as a fresh one; every kept picture is noted in img_seen;
 //  - the run is logged in events;
-//  - a Display P3 PNG, a turned JPEG and a wide WebP keep their colour profile, drawn as sharp's converted WebP is; sRGB carries none.
+//  - a Display P3 PNG, a turned JPEG and a wide WebP keep their colour profile, drawn as sharp's converted WebP is; sRGB carries none;
+//  - a picture with transparency that runs out of memory at the desktop size is tried again the next minute at effort 2, and if it
+//  still does not fit, gets the phone size alone, the original staying for the desktop.
 // Usage: node test/imgwork.mjs (exit 1 on any failed check)
+// CONTROL: IMGWORK_SRC=<an img/src/index.js from before a change> node test/imgwork.mjs fails what that change added.
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -35,7 +38,7 @@ function r2() {
   return store;
 }
 // the Worker, with its.wasm import turned into a module compiled here
-const src = readFileSync(HUB + "img/src/index.js", "utf8").replace('import SHRINK_WASM from "../wasm/shrink.wasm";', `const SHRINK_WASM = new WebAssembly.Module(${JSON.stringify("__WASM__")});`);
+const src = readFileSync(process.env.IMGWORK_SRC || HUB + "img/src/index.js", "utf8").replace('import SHRINK_WASM from "../wasm/shrink.wasm";', `const SHRINK_WASM = new WebAssembly.Module(${JSON.stringify("__WASM__")});`);
 const tmp = HUB + "test/_imgwork_worker.mjs";
 writeFileSync(tmp, src.replace(`new WebAssembly.Module("__WASM__")`, `new WebAssembly.Module((await import("node:fs")).readFileSync(${JSON.stringify(HUB + "img/wasm/shrink.wasm")}))`));
 const W = await import(tmp); unlinkSync(tmp);
@@ -250,6 +253,26 @@ async function setup() {
   await W.tick(s.env); W.IMG.reuse = reuse0;
   check(W.bigDropCount() === d0 + 1 && s.row(k).state === "done" && /1080: skipped \(a big instance was dropped/.test(s.row(k).note || "") && s.STORE.m.has("imgv/" + k.slice(4) + "-1600"),
     `an instance past 32 MiB retired at its reuse limit counts as a big drop, and the run makes no phone size after it (${W.bigDropCount() - d0}, ${s.row(k).note})`);
+}
+// 3g. out of memory at the desktop size: 2,000 x 2,000 PNGs with transparency, the alpha plane what costs the memory
+{
+  let seed = 7; const rnd = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 16) & 255;
+  const rgba = (fa, fc) => { const b = Buffer.alloc(2000 * 2000 * 4); for (let y = 0, i = 0; y < 2000; y++) for (let x = 0; x < 2000; x++, i += 4) { const c = fc(x, y); b[i] = c[0]; b[i + 1] = c[1]; b[i + 2] = c[2]; b[i + 3] = fa(x, y); } return sharp(b, { raw: { width: 2000, height: 2000, channels: 4 } }).png().toBuffer(); };
+  // a soft radial shadow: too much for effort 4 at 1,600 px, fits at effort 2
+  const SOFT = await rgba((x, y) => Math.max(0, Math.min(255, Math.round(255 - Math.hypot(x - 1000, y - 1000) / 5.5 + (rnd() % 13) - 6))), (x, y) => [(x * 255 / 2000) | 0, (y * 255 / 2000) | 0, 120]);
+  // noise in the alpha: fits at no effort at 1,600 px, fits at 1,080
+  const GRAIN = await rgba(() => rnd(), () => [200, 60, 40]);
+  const s = await setup(), k = s.put(1, SOFT, "image/png");
+  await W.tick(s.env); const r1 = s.row(k);
+  await W.tick(s.env); const r2 = s.row(k), sizes = ["1600", "1080"].map((w) => s.STORE.m.has(`imgv/${k.slice(4)}-${w}`));
+  check(r1.state === "pending" && r1.tries === 0 && /^lean: 1600: no memory at effort 4/.test(r1.note || "") && r2.state === "done" && sizes.every(Boolean) && !s.STORE.m.has(k),
+    `a soft shadow out of memory at effort 4 waits a minute, not counted as a failure, then gets both sizes at effort 2 and its original goes (${r1.state} "${r1.note}", then ${r2.state}, sizes ${sizes})`);
+  const g = await setup(), kg = g.put(1, GRAIN, "image/png");
+  await W.tick(g.env); const g1 = g.row(kg); await W.tick(g.env); const g2 = g.row(kg); await W.tick(g.env); const g3 = g.row(kg);
+  const p16 = g.STORE.m.has(`imgv/${kg.slice(4)}-1600`), p10 = g.STORE.m.get(`imgv/${kg.slice(4)}-1080`);
+  check(g1.state === "pending" && /^lean: 1600/.test(g1.note || "") && g2.state === "pending" && /^lean: phone size only/.test(g2.note || "") && g3.state === "done" && !p16 && !!p10 && g.STORE.m.has(kg),
+    `one that fits at no effort gets the phone size alone on the third minute, its original kept for the desktop (${g1.note} / ${g2.note} / ${g3.state} ${g3.note}; 1600 ${p16}, 1080 ${!!p10})`);
+  check(g3.kept === GRAIN.length + (p10 ? p10.buf.length : 0) && g3.tries === 0, `and what is kept counts the original and the phone size (${g3.kept} = ${GRAIN.length} + ${p10 && p10.buf.length}, tries ${g3.tries})`);
 }
 // 4. the reused instance gives the same bytes as the first call, over more pictures than one instance lives for
 {

@@ -414,12 +414,18 @@ function buildMime(d) {
   const plainPart = `Content-Type: text/plain; charset=UTF-8${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(d.text || "").replace(/(.{76})/g, "$1" + nl)}`;
   const altB = "=_alt_" + Math.random().toString(36).slice(2);
   const textPart = d.html ? `Content-Type: multipart/alternative; boundary="${altB}"${nl}${nl}--${altB}${nl}${plainPart}${nl}--${altB}${nl}Content-Type: text/html; charset=UTF-8${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(d.html).replace(/(.{76})/g, "$1" + nl)}${nl}--${altB}--${nl}` : plainPart;
+  // Inline pictures (a forward's) go beside the HTML that names them, in a multipart/related, under their Content-ID.
+  const inl = d.html ? (d.attachments || []).filter((a) => a.disposition === "inline" && a.contentId) : [], files = (d.attachments || []).filter((a) => !inl.includes(a));
+  let core = textPart;
+  if (inl.length) { const relB = "=_rel_" + Math.random().toString(36).slice(2); core = `Content-Type: multipart/related; boundary="${relB}"${nl}${nl}--${relB}${nl}${textPart}${nl}`;
+    for (const a of inl) core += `--${relB}${nl}Content-Type: ${a.type || "application/octet-stream"}; name="${a.filename}"${nl}Content-Disposition: inline; filename="${a.filename}"${nl}Content-ID: <${String(a.contentId).replace(/[<>\r\n]/g, "")}>${nl}Content-Transfer-Encoding: base64${nl}${nl}${a.content.replace(/(.{76})/g, "$1" + nl)}${nl}`;
+    core += `--${relB}--${nl}`; }
   let body;
-  if (d.attachments && d.attachments.length) {
-    body = `Content-Type: multipart/mixed; boundary="${boundary}"${nl}${nl}--${boundary}${nl}${textPart}${nl}`;
-    for (const a of d.attachments) body += `--${boundary}${nl}Content-Type: ${a.type || "application/octet-stream"}; name="${a.filename}"${nl}Content-Disposition: attachment; filename="${a.filename}"${nl}Content-Transfer-Encoding: base64${nl}${nl}${a.content.replace(/(.{76})/g, "$1" + nl)}${nl}`;
+  if (files.length) {
+    body = `Content-Type: multipart/mixed; boundary="${boundary}"${nl}${nl}--${boundary}${nl}${core}${nl}`;
+    for (const a of files) body += `--${boundary}${nl}Content-Type: ${a.type || "application/octet-stream"}; name="${a.filename}"${nl}Content-Disposition: attachment; filename="${a.filename}"${nl}Content-Transfer-Encoding: base64${nl}${nl}${a.content.replace(/(.{76})/g, "$1" + nl)}${nl}`;
     body += `--${boundary}--${nl}`;
-  } else body = textPart;
+  } else body = core;
   const raw = hdr.join(nl) + nl + body;
   return b64u.enc(new TextEncoder().encode(raw));
 }
@@ -727,7 +733,8 @@ async function mirrorHubCopies() {
   } catch (_) {} finally { mirrorHubCopies.busy = false; if (calls) { perf.record("mirror:copies", performance.now() - t0); perf.record("mirror:copies:calls", calls); updateBadge(); } }
 }
 // Unread in the inbox, by sidebar entry: the Domains entry counts only the domains without a row of their own.
-function counts() { const c = { inbox: 0, personal: 0, notifications: 0, newsletters: 0, unread: 0, acct: {} }; for (const t of state.threads.values()) { if (unreadListed(t)) c.unread++; if (t.state !== "inbox" || !t.unread) continue; if (isHubCopy(t)) continue; c.inbox++; c[catOf(t)] = (c[catOf(t)] || 0) + 1; const k = sideIdOf(t); c.acct[k] = (c.acct[k] || 0) + 1; } return c; }
+// A conversation set aside is not in the inbox's list, so it is not in its count either, nor in the app's badge.
+function counts() { const c = { inbox: 0, personal: 0, notifications: 0, newsletters: 0, unread: 0, acct: {} }; const aside = new Set(prefs().setAside || []); for (const t of state.threads.values()) { if (unreadListed(t)) c.unread++; if (t.state !== "inbox" || !t.unread) continue; if (isHubCopy(t) || aside.has(t.key)) continue; c.inbox++; c[catOf(t)] = (c[catOf(t)] || 0) + 1; const k = sideIdOf(t); c.acct[k] = (c.acct[k] || 0) + 1; } return c; }
 // ---------- notifications: a conversation you have handled must not stay in the Android shade (Spark's behaviour) ----------
 // Three layers, in falling order of cost. (a) This device, instantly and offline: close the notification whose tag is this thread.
 // (b) This device while the app was closed: the service worker re-checks IndexedDB when the next push arrives and sweeps what is
@@ -1361,11 +1368,22 @@ async function backfillUnsub() {
 // answer only from what it holds, so a warm-up never reaches a sender; none when the phone is saving data. The same URL as the frame's
 // own <img> request, so that request is a cache hit.
 const warmed = new Set();
+// The mail's fonts are warmed too, all of them, before its pictures: text is what shows first. A face's first font
+// address (the one the browser takes, and the one the hub kept), each stylesheet's copy, and the fonts that copy names; the browser
+// keeps a held font a year, so the frame finds it in the cache and draws the mail in it from the first frame.
+const FONT_FIRST = /url\((\/api\/img\?u=[^)]+)\)\s*(?:format\(\s*["']?([\w-]+)["']?\s*\))?/g;
 function warmPictures(docs) {
   if (navigator.connection?.saveData) return;
-  const urls = [];
-  for (const d of docs) { for (const m of String(d).matchAll(/\/api\/img\?u=[^"'\s<>)]+/g)) { const u = m[0].replace(/&amp;/g, "&"); if (!urls.includes(u)) urls.push(u); if (urls.length >= 4) break; } if (urls.length >= 4) break; }
-  for (const u of urls) { if (warmed.has(u)) continue; if (warmed.size > 2000) warmed.clear(); warmed.add(u); fetch(u, { headers: { "x-warm": "1" }, priority: "low", credentials: "same-origin" }).catch(() => {}); }
+  const urls = [], fonts = [], sheets = [], warm = (u) => { if (warmed.has(u)) return null; if (warmed.size > 2000) warmed.clear(); warmed.add(u); return fetch(u, { headers: { "x-warm": "1" }, priority: "low", credentials: "same-origin" }).catch(() => null); };
+  for (const d of docs) {
+    const s = String(d);
+    for (const f of s.matchAll(/@font-face\s*\{[^{}]*\}/g)) for (const m of f[0].matchAll(FONT_FIRST)) { if (m[2] && !/^(woff2?|truetype|opentype|collection)/i.test(m[2])) continue; if (!fonts.includes(m[1])) fonts.push(m[1]); break; }
+    for (const m of s.matchAll(/\/api\/fontcss\?u=[^"'\s<>)]+/g)) if (!sheets.includes(m[0])) sheets.push(m[0]);
+    for (const m of s.replace(/@font-face\s*\{[^{}]*\}/g, " ").matchAll(/\/api\/img\?u=[^"'\s<>)]+/g)) { if (urls.length >= 4) break; const u = m[0].replace(/&amp;/g, "&"); if (!urls.includes(u)) urls.push(u); }
+  }
+  for (const u of fonts.slice(0, 24)) warm(u);
+  for (const u of sheets.slice(0, 6)) { const p = warm(u); if (p) p.then((r) => (r && r.ok ? r.text() : "")).then((css) => { for (const m of String(css || "").matchAll(/src:url\("(\/api\/img\?u=[^"]+)"\)/g)) warm(m[1]); }).catch(() => {}); }
+  for (const u of urls) warm(u);
 }
 function prerender(t, d) {
   refreshRowFromBodies(t, d);
@@ -1470,7 +1488,14 @@ async function bulk(action, threads, { quiet = false, id = uuid4(), inPlace = fa
   if (action === "trash" && threads.length > 50 && !sure && !(await ask(`Move ${threads.length} conversations to Trash? Undo stays available for 7 days.`, { ok: "Trash them", danger: true }))) return;
   const before = {}; const patchv = BULK_PATCH[action]; if (!patchv) return toast("Unknown bulk action " + action);
   const drop = () => { let full = false; for (const t of threads) { if (state.cur === t.key) removeFromList(t); else if (!dropRowNode(t.key, dayLabel(t.date))) full = true; } if (full) render(); };
-  perf.measure("bulk:" + action, () => { for (const t of threads) { before[t.key] = { state: t.state, starred: t.starred, unread: t.unread }; Object.assign(t, patchv); if (action === "restore") t.binnedIds = null; /* threads.modify takes TRASH off every message, the trashed few of a live conversation too */ t.updatedAt = Date.now(); queue.recent.set(t.key, Date.now()); announce(t); } if (inUnread()) state.keep = new Set(); if (inPlace) drop(); else render(); updateBadge(); }); // recent: a sync already in flight cannot overwrite these rows
+  // Where the phone's 0.9 s goes (909 ms median in the field against 33-52 ms here at 4x CPU): the wait between the tap
+  // and this code running, each part of the work, and the wait from its end to the next frame, each a timer of its own in /api/perf.
+  const tIn = perf.lastInput, tGo = performance.now(); if (tIn && tGo - tIn < 5000) perf.record("bulk:phase:input-wait", tGo - tIn);
+  let tEnd = 0;
+  perf.measure("bulk:" + action, () => { const ta = performance.now(); for (const t of threads) { before[t.key] = { state: t.state, starred: t.starred, unread: t.unread }; Object.assign(t, patchv); if (action === "restore") t.binnedIds = null; /* threads.modify takes TRASH off every message, the trashed few of a live conversation too */ t.updatedAt = Date.now(); queue.recent.set(t.key, Date.now()); announce(t); }
+    const tb = performance.now(); perf.record("bulk:phase:patch", tb - ta); if (inUnread()) state.keep = new Set(); if (inPlace) drop(); else render(); const tc = performance.now(); perf.record("bulk:phase:draw", tc - tb); updateBadge(); tEnd = performance.now(); perf.record("bulk:phase:badge", tEnd - tc); }); // recent: a sync already in flight cannot overwrite these rows
+  requestAnimationFrame(() => perf.record("bulk:phase:to-frame", performance.now() - tEnd));
+  perf.record("bulk:count", threads.length);
   const job = { id, at: Date.now(), action, keys: threads.map((t) => t.key), before, status: "queued", count: threads.length };
   const logged = bulkLogSave([job, ...state.bulkLog]);   // in the log before the first wait, so an Undo tapped at once finds it
   await idb.putAll("threads", threads);
@@ -2374,6 +2399,17 @@ const picW = () => { try { return matchMedia(PHONE_MQ).matches ? 1080 : 1600; } 
 // day's mail is one entry in the device's cache a day, not one a mail.
 const proxied = (url, t) => "/api/img?u=" + encodeURIComponent(url) + (imgPass ? "&k=" + imgPass : "") + "&w=" + picW() + (t > 0 ? "&t=" + Math.floor(t / 864e5) * 864e5 : "");
 const keyed = (url) => (url && imgPass ? url + (url.includes("?") ? "&" : "?") + "k=" + imgPass : url);   // an attachment image (cid:) the app wrote
+// A mail's font stylesheet, as the hub kept it when the mail arrived: GET /api/fontcss answers its usable @font-face
+// rules, each font an /api/img address with this same key and day, so a font is answered exactly as the mail's pictures are.
+const fontSheet = (url, t) => "/api/fontcss?u=" + encodeURIComponent(url) + (imgPass ? "&k=" + imgPass : "") + (t > 0 ? "&t=" + Math.floor(t / 864e5) * 864e5 : "");
+// A mail's CSS with its fonts made the hub's: an @import of an absolute stylesheet becomes the hub's copy of it (any other @import goes:
+// a mail has no base URL of its own), and every @font-face gets font-display: fallback, so its text shows at once in the mail's next
+// font while its own is on its way (at most ~100 ms of blank text, the font taken if it comes within 3 s) instead of the up to 3 s of
+// invisible text a browser allows by default. The url()s inside @font-face are proxied with every other url() (proxyImages).
+const CSS_IMPORT_AT = /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)|"([^"]*)"|'([^']*)')[^;{}]*;?/gi;
+const fontCssOf = (css, t) => css
+  .replace(CSS_IMPORT_AT, (m0, a, b, c, d, e) => { const u = (a ?? b ?? c ?? d ?? e ?? "").trim(); return /^(https?:)?\/\//i.test(u) ? `@import url("${fontSheet(/^\/\//.test(u) ? "https:" + u : u, t)}");` : ""; })
+  .replace(/@font-face\s*\{([^{}]*)\}/gi, (m0, body) => `@font-face{${body.replace(/(^|;)\s*font-display\s*:[^;]*/gi, "$1")};font-display:fallback}`);
 // ---- picture sizes ----
 // Founder: a mail loaded in visible steps. The text is written at once and each picture then arrives
 // with no box held for it, so the mail grows in steps. Half the pictures in real mail carry a width and no height (48 % of 583 in 116
@@ -2459,6 +2495,9 @@ function applyImgDims(d) {
 // links were not pre-resolved even when the mail turned prefetching on) and a <link rel="dns-prefetch"> ignored it, which is why
 // proxyImages makes every <link> inert.
 const frameImgSrc = () => ["/api/img", "/api/att/", "/api/gmail/att/"].map((p) => location.origin + p).join(" ");
+// Fonts from /api/img and stylesheets from /api/fontcss alone: an exact path each, so a mail's own @font-face or @import
+// naming any other hub address is refused by the frame, and the hub refuses a font or stylesheet load without the image key as well.
+const frameFontSrc = () => location.origin + "/api/img", frameSheetSrc = () => location.origin + "/api/fontcss";
 // Every link in a mail is rewritten to where it really goes, and says so. The href becomes cleanLink's URL (tracking
 // parameters off, Google and Outlook redirects unwrapped) which is what the tap handler did on Android and Windows and the Mac never
 // saw: WebKit runs no page listener inside the scriptless frame, so there the shell opened the href as written. The title is that URL,
@@ -2631,10 +2670,14 @@ function proxyImages(h, atts, found = [], t = 0) {
   const cssUrl = (u, decode) => { const d = decode ? unent(u.trim()) : u.trim(); return "url(" + proxied(/^\/\//.test(d) ? "https:" + d : d, t).replace(/[()']/g, (ch) => "%" + ch.charCodeAt(0).toString(16).toUpperCase()) + ")"; };
   // (A URL stops at the next `url(`, as in blockSpyTrackers: a run of unclosed `url(//` was otherwise read from each one to its end.)
   const CSS_URL = /url\(\s*(['"]?)((?:https?:)?\/\/(?:(?!url\()[^)'"])+)\1\s*\)/gi;
-  h = mapStyles(h, (css) => css.replace(CSS_URL, (m1, q, u) => cssUrl(u, false)));
+  h = mapStyles(h, (css) => fontCssOf(css, t).replace(CSS_URL, (m1, q, u) => cssUrl(u, false)));
   h = h.replace(CSS_URL, (m0, q, u) => cssUrl(u, true));
   // (no second pass over background=: attr("background") above already covers td, th, table, body and div, and running px over the
   // proxied value again now drops it as a relative URL)
+  // A linked stylesheet is read for its fonts alone: the hub kept its @font-face rules when the mail arrived and the
+  // frame imports that copy, last, so no pass above reads the hub's own address as the mail's. The <link> itself stays inert.
+  h = h.replace(/<mh-link\b[^<>]*>/gi, (tag) => { const rel = ` ${(tagAttr(tag, "rel") || "").toLowerCase()} `, href = (tagAttr(tag, "href") || "").trim();
+    return /\sstylesheet\s/.test(rel) && !/\salternate\s/.test(rel) && /^(https?:)?\/\//i.test(href) ? `${tag}<style>@import url("${fontSheet(/^\/\//.test(href) ? "https:" + href : href, t)}");</style>` : tag; });
   return h;
 }
 function renderFeed(rows, el) {
@@ -2863,7 +2906,10 @@ function tagSafe(h) {
   }
   return s;
 }
-const tagSafeMsg = (m) => m && m.html && !m.text ? { ...m, html: tagSafe(m.html) } : m;
+// The search index's copy: HTML comments go first, as the browser drops them (an Outlook-only <!--[if mso]> block with
+// them), in one pass that cannot go quadratic; tagSafe would otherwise turn the `<` of a <!--<![endif]--> into text.
+const dropHtmlComments = (h) => { const s = String(h || ""); let out = "", at = 0; for (;;) { const i = s.indexOf("<!--", at); if (i < 0) break; const j = s.indexOf("-->", i + 4); if (j < 0) { out += s.slice(at, i); at = s.length; break; } out += s.slice(at, i) + " "; at = j + 3; } return at ? out + s.slice(at) : s; };
+const tagSafeMsg = (m) => m && m.html && !m.text ? { ...m, html: tagSafe(dropHtmlComments(m.html)) } : m;
 // The domains that have written to the user, for the impostor banner: asked of the hub once a session, at boot,
 // and after a failure again on a draw a minute later at the soonest. A message drawn before it is in just has no banner.
 let impostorAsk = null;
@@ -3420,7 +3466,7 @@ function messageHtml(m, i, n, docs = [], opts = {}) {
   // before. It is on the long runs alone (markLongRuns): on the whole body it shrank table cells to one letter.
   // A mail nested past MAIL_MAX_DEPTH is shown as its text: the browser's parse of that HTML alone takes seconds (htmlDepth).
   const deep = !!m.html && htmlDepth(m.html, MAIL_MAX_DEPTH) > MAIL_MAX_DEPTH;
-  if (m.html && !deep) { const theme = mailTheme(m.html); const frameDoc = (h, trk) => `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="x-dns-prefetch-control" content="off"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: ${frameImgSrc()}; style-src 'unsafe-inline'; font-src data:; form-action 'none'; frame-src 'none'"><base target="_blank"><style>html,body{margin:0;padding:10px;color:#111;background:#fff;font:14px -apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden;touch-action:pan-x pan-y}:where([data-mh-wrap]){overflow-wrap:anywhere}${theme === "dark" ? MAIL_DARK_CSS : ":root{color-scheme:light}"}img{height:auto}:where(html[data-mh-shrink]) img{max-width:100%}table{max-width:100%}pre{white-space:pre-wrap;overflow-wrap:break-word}::highlight(mhfind){background:#ffe600;color:#111}::highlight(mhcur){background:#ff8a00;color:#111}</style></head><body>${cleanMailTags(proxyImages(theme === "paper" ? mailOnPaper(h) : h, atts, trk, m.out ? 0 : m.date))}</body></html>`; const k = docs.push(frameDoc(m.html, trackers)) - 1;
+  if (m.html && !deep) { const theme = mailTheme(m.html); const frameDoc = (h, trk) => `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="x-dns-prefetch-control" content="off"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: ${frameImgSrc()}; style-src 'unsafe-inline' ${frameSheetSrc()}; font-src data: ${frameFontSrc()}; form-action 'none'; frame-src 'none'"><base target="_blank"><style>html,body{margin:0;padding:10px;color:#111;background:#fff;font:14px -apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden;touch-action:pan-x pan-y}:where([data-mh-wrap]){overflow-wrap:anywhere}${theme === "dark" ? MAIL_DARK_CSS : ":root{color-scheme:light}"}img{height:auto}:where(html[data-mh-shrink]) img{max-width:100%}table{max-width:100%}pre{white-space:pre-wrap;overflow-wrap:break-word}::highlight(mhfind){background:#ffe600;color:#111}::highlight(mhcur){background:#ff8a00;color:#111}</style></head><body>${cleanMailTags(proxyImages(theme === "paper" ? mailOnPaper(h) : h, atts, trk, m.out ? 0 : m.date))}</body></html>`; const k = docs.push(frameDoc(m.html, trackers)) - 1;
     const cut = fold ? quoteSplitHtml(m.html) : null; const kt = cut ? docs.push(frameDoc(cut, [])) - 1 : k;   // the trackers note speaks for the whole mail
     const dk = theme === "dark" ? " data-dark=\"1\"" : ""; body = collapsed ? `<div class="lazyb" data-doc="${kt}"${dk}></div>` : `<iframe ${FRAME_ATTRS} data-doc="${kt}"${dk}></iframe>`;
     if (cut) body += dots(` data-full="${k}" data-trim="${kt}"`); }
@@ -4318,6 +4364,58 @@ async function sendReply(later) {
 }
 const quote = (m) => `\n\nOn ${new Date(m.date).toLocaleString()}, ${m.from} wrote:\n` + plainOf(m).split("\n").map((l) => "> " + l).join("\n");
 const FWD_MARK = "---------- Forwarded message ----------";
+// ---------- a forward that looks like the mail you got ----------
+// A forward the app built (from a Gmail account, or of a Gmail mail) carried only text: the original flattened, its buttons left as
+// words with no link behind them. A concert invitation forwarded to a friend arrived as 1,061 bytes of text whose "Sign Up"
+// went nowhere. Now every forward carries the original as it arrived, the way Gmail forwards it: under the note and a "Forwarded message"
+// header, the original's HTML (its links, its pictures at their own addresses, its styles moved to the head where mail apps read them),
+// its inline pictures as parts of the forward, its files attached, and a text part for text-only readers that keeps each link's
+// address. The hub builds the same for a hub mail sent from a hub address (index.js forwardMessage). The forwarded block in the
+// compose box is text; when it has been edited (a number taken out, say), the edit wins and the forward goes as that text alone.
+const fwdBlock = (m) => `${FWD_MARK}\nFrom: ${m.from}\nDate: ${new Date(m.date).toLocaleString()}\nSubject: ${m.subject}\nTo: ${m.to}\n\n${plainLinked(m)}`;
+// A mail's text with each link's address kept: "Sign Up <https://…>" where its HTML had a button (its own text part, when it has one).
+function plainLinked(m) {
+  if (m.text || !m.html) return plainOf(m);
+  const linked = String(m.html).replace(/<a\b[^<>]*?[\s"']href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^<>]*>([\s\S]*?)<\/a\s*>/gi, (m0, a, b, c, inner) => {
+    const href = htmlUnent(a ?? b ?? c ?? "").trim(), words = inner.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    return /^(https?:|mailto:)/i.test(href) && !htmlUnent(words).includes(href) ? `${inner} &lt;${esc(href.replace(/^mailto:/i, ""))}&gt;` : m0;
+  });
+  return plainOf({ html: linked });
+}
+// The original's HTML as the body of a forward: its <style> blocks for the head, its <body>'s content and look for a wrapper.
+function fwdParts(html) {
+  const h = String(html || "").replace(/<script\b[\s\S]*?<\/script\s*>/gi, "");
+  const styles = [...h.matchAll(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi)].map((x) => x[0]).join("\n");
+  const bm = /<body\b([^>]*)>([\s\S]*?)(?:<\/body\s*>|$)/i.exec(h);
+  let inner = bm ? bm[2] : h.replace(/<!doctype[^>]*>/i, "").replace(/<head\b[\s\S]*?<\/head\s*>/i, "").replace(/<\/?html\b[^>]*>/gi, "");
+  inner = inner.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "");
+  const at = bm ? bm[1] : "", bg = /[\s"']bgcolor\s*=\s*["']?([#\w]+)/i.exec(" " + at)?.[1], st = /[\s"']style\s*=\s*"([^"]*)"/i.exec(" " + at)?.[1] || "";
+  return { styles, inner, look: `${bg ? `background-color:${bg};` : ""}${st}`.replace(/"/g, "'") };
+}
+function fwdHtml(noteHtml, m) {
+  const p = fwdParts(m.html), who = (v) => esc(v || "");
+  return `<!doctype html><html><head><meta charset="utf-8">${p.styles}</head><body>${noteHtml}<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">---------- Forwarded message ---------<br>From: ${who(m.from)}<br>Date: ${who(new Date(m.date).toLocaleString())}<br>Subject: ${who(m.subject)}<br>To: ${who(m.to)}<br></div><br><br><div${p.look ? ` style="${p.look}"` : ""}>${p.inner}</div></div></body></html>`;
+}
+const b64OfBytes = (b) => { const u = b instanceof Uint8Array ? b : new Uint8Array(b); let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
+async function fwdBytes(t, m, a) {
+  if (t?.kind === "gmail") return adapterFor(t.account).attachment(a.msgId || m.id, a.id);
+  const r = await fetch(a.url || "/api/att/" + a.id, { credentials: "same-origin" }); if (!r.ok) throw new Error(`${a.name || "a file"}: ${r.status}`); return new Uint8Array(await r.arrayBuffer());
+}
+// The draft a forward sends, from the compose box's own draft (`d`, its files already in d.attachments) and the note above the block:
+// the original's inline pictures always come along, and a hub mail's files too (a Gmail mail's are added to the box when it opens).
+async function forwardDraft(d, fwd, note, md) {
+  const { t, m } = fwd; if (!m?.html) return d;
+  const inline = [], files = [];
+  for (const a of m.attachments || []) {
+    const cid = String(a.cid || "").trim().replace(/^<|>$/g, ""), pic = /^image\//i.test(a.mime || "");
+    if (cid && pic) inline.push({ a, cid }); else if (t?.kind !== "gmail" && a.id) files.push(a);
+  }
+  const att = [];
+  for (const { a, cid } of inline) { try { att.push({ filename: a.name || cid, type: a.mime, content: b64OfBytes(await fwdBytes(t, m, a)), disposition: "inline", contentId: cid }); } catch (_) {} }
+  for (const a of files) { try { att.push({ filename: a.name || "attachment", type: a.mime || "application/octet-stream", content: b64OfBytes(await fwdBytes(t, m, a)) }); } catch (e) { toast("Couldn't add the original's file: " + (e?.message || e), 6000); } }
+  const noteHtml = note ? (md ? mdToHtml(note) : `<div>${esc(note).replace(/\n/g, "<br>")}</div>`) : "";
+  return { ...d, text: (note ? note + "\n\n" : "") + fwdBlock(m), html: fwdHtml(noteHtml, m), attachments: [...(d.attachments || []), ...att] };
+}
 // A message's text for a quote or a forward. Mail sent as HTML only (common from Gmail senders) has no text part, so both came out
 // empty. Parsed inert: DOMParser runs no scripts and loads nothing.
 function plainOf(m) {
@@ -4348,7 +4446,7 @@ function openCompose({ forward = false, draft = null, draftId = null, rev = 0 } 
   $("#cto").value = $("#ccc").value = $("#cbcc").value = ""; clearFiles($("#cfiles")); $("#cprev").style.display = "none";
   const def = state.me.identities[0]?.email || state.gmail[0]?.email || "";
   $("#cfrom").value = t ? (t.kind === "gmail" ? t.account : (t.identity || def)) : def; $("#cname").value = nameFor($("#cfrom").value); syncBrand("#cfrom");
-  if (forward && m) { $("#csub").value = /^fwd?:/i.test(m.subject || "") ? m.subject : "Fwd: " + (m.subject || ""); $("#ctext").value = sigFor($("#cfrom").value) + `\n\n${FWD_MARK}\nFrom: ${m.from}\nDate: ${new Date(m.date).toLocaleString()}\nSubject: ${m.subject}\nTo: ${m.to}\n\n${plainOf(m)}`; state.fwd = { t, m }; if (t?.kind === "gmail") attachOriginal(t, m); }
+  if (forward && m) { $("#csub").value = /^fwd?:/i.test(m.subject || "") ? m.subject : "Fwd: " + (m.subject || ""); const block = fwdBlock(m); $("#ctext").value = sigFor($("#cfrom").value) + `\n\n${block}`; state.fwd = { t, m, block }; if (t?.kind === "gmail") attachOriginal(t, m); }
   else { $("#csub").value = ""; $("#ctext").value = sigFor($("#cfrom").value); state.fwd = null; }
   $("#cto").focus();
 }
@@ -4365,16 +4463,23 @@ async function sendCompose(later) {
   // A hub forward: the hub adds the forwarded block and the original's files itself, so only the note above the block is sent (the
   // block went out twice). Bcc and the Markdown note go with it, and Send later schedules the same forward (it was a plain send
   // without the original's files).
-  const hubFwd = state.fwd && state.fwd.t.kind === "hub" && !isGmail ? state.fwd.m.id : null;
-  const cut = hubFwd ? text.indexOf(FWD_MARK) : -1; const body = cut >= 0 ? text.slice(0, cut).replace(/\s+$/, "") : text;
+  // A forward: the note is what is above the block. The block as it was written sends the original as it arrived: the
+  // hub builds that for a hub mail from a hub address, forwardDraft for every other. An edited block (or one deleted) goes as the
+  // text now in the box: the hub still adds the original's files to a hub forward, and nothing else of the original goes.
+  const fwd = state.fwd || null, at = fwd ? text.indexOf(FWD_MARK) : -1;
+  const asIs = !!fwd && at >= 0 && text.slice(at).trim() === String(fwd.block || "").trim();
+  const note = at >= 0 ? text.slice(0, at).replace(/\s+$/, "") : text;
+  const hubFwd = fwd && fwd.t.kind === "hub" && !isGmail ? fwd.m.id : null;
+  const body = hubFwd && asIs ? note : text;
+  const rich = async (d) => (fwd && asIs && !hubFwd ? forwardDraft(d, fwd, note, $("#cmd").checked) : hubFwd && !asIs ? { ...d, as_typed: true } : d);
   try {
     $("#csend").disabled = true;
     if (later) return pickTime("Send at", async (due) => {
-      const fd = withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom") }, $("#cmd").checked); const draft = isGmail ? { raw: buildMime(fd), subject, to: to.join(", ") } : hubFwd ? { ...fd, forward_of: hubFwd } : fd;
+      const fd = await rich(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom") }, $("#cmd").checked)); const draft = isGmail ? { raw: buildMime(fd), subject, to: to.join(", ") } : hubFwd ? { ...fd, forward_of: hubFwd } : fd;
       await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: isGmail ? from : "hub", due_at: due.toISOString(), draft }) }); toast("Scheduled"); const same = editors.c === dh; draftSent(dh); if (same) finishCompose(); offerUnsent();
     });
     const md = $("#cmd").checked;
-    const draft = withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom"), messageId: isGmail ? `${uuid4()}@mail.gmail.com` : undefined }, md);
+    const draft = await rich(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom"), messageId: isGmail ? `${uuid4()}@mail.gmail.com` : undefined }, md));
     const dId = dh.id || undefined;
     const row = hubFwd ? await queueSend({ forwardOf: hubFwd, draft, typed: text, draftId: dId }) : await queueSend({ gmail: isGmail ? from : null, draft, draftId: dId });
     if (!row) return;   // "send anyway?" declined: the message stays open as it was (it was emptied;
@@ -4787,11 +4892,22 @@ function draftFromArgs(args) {
 }
 
 // ---------- scheduled view ----------
+// Drawn at once from what the app has: the boot's own /api/schedule answer, kept current by every snooze, send-later and
+// cancel, so the screen no longer waits on the hub with the previous view still showing; the hub's answer then redraws it only if it
+// differs, and only while Scheduled is still the view.
 async function renderScheduled() {
-  const s = await api("/api/schedule?status=pending"); state.schedules = s.actions || [];
+  drawScheduled();
+  const seq = (renderScheduled.seq = (renderScheduled.seq || 0) + 1);
+  let s; try { s = await api("/api/schedule?status=pending"); } catch (_) { return; }
+  if (seq !== renderScheduled.seq || state.view.kind !== "scheduled") return;
+  const next = s.actions || []; if (JSON.stringify(next) === JSON.stringify(state.schedules || [])) return;
+  state.schedules = next; drawScheduled();
+}
+function drawScheduled() {
+  state.schedules ||= [];
   $("#chips").innerHTML = ""; const el = $("#threads");
   el.innerHTML = state.schedules.length ? state.schedules.map((a) => `<div class="t" style="grid-template-columns:1fr auto"><div class="who">${esc(a.kind.replace("_", " "))} · ${esc(accountOf(a.account)?.label || a.account)}</div><div class="when">${esc(new Date(a.due_at).toLocaleString())}</div><div class="sub">${esc(a.payload?.subject || a.payload?.title || a.ref || "")}</div><div class="snip"><button data-cancel="${a.id}" style="padding:2px 8px;font-size:12px">Cancel</button></div></div>`).join("") : '<div class="empty">Nothing scheduled</div>';
-  el.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = async () => { const r = await api("/api/schedule/" + b.dataset.cancel, { method: "DELETE" }); if (r.kind === "snooze" && r.account !== "hub") { const k = `${r.account}|${r.ref}`, lt = state.threads.get(k); if (!lt || lt.state === "snoozed" || state.snoozedGmail.has(k)) { try { await gmailAdapter(r.account).act({ id: r.ref, state: "archived" }, "restore"); const id = await gmailLabel(r.account, "Snoozed (Mail)").catch(() => null); if (id) await gapi(r.account, `threads/${r.ref}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [], removeLabelIds: [id] }) }); } catch (_) {} } state.snoozedGmail.delete(k); } /* only a conversation still snoozed comes back */ toast("Cancelled"); renderScheduled(); });
+  el.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = async () => { const r = await api("/api/schedule/" + b.dataset.cancel, { method: "DELETE" }); if (r.kind === "snooze" && r.account !== "hub") { const k = `${r.account}|${r.ref}`, lt = state.threads.get(k); if (!lt || lt.state === "snoozed" || state.snoozedGmail.has(k)) { try { await gmailAdapter(r.account).act({ id: r.ref, state: "archived" }, "restore"); const id = await gmailLabel(r.account, "Snoozed (Mail)").catch(() => null); if (id) await gapi(r.account, `threads/${r.ref}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [], removeLabelIds: [id] }) }); } catch (_) {} } state.snoozedGmail.delete(k); } /* only a conversation still snoozed comes back */ state.schedules = (state.schedules || []).filter((x) => x.id !== b.dataset.cancel); toast("Cancelled"); renderScheduled(); });
 }
 
 // ---------- settings ----------
@@ -5702,6 +5818,17 @@ for (const [inp, lbl] of [["#rfiles", "#rfilesn"], ["#cfiles", "#cfilesn"]]) $(i
 window.addEventListener("online", () => { document.body.classList.remove("is-offline"); refresh({ silent: true }); }); window.addEventListener("offline", () => document.body.classList.add("is-offline"));
 // Swept twice: at once for what the page already knew, and again when the refresh has brought it up to date.
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { adoptOnResume(); refresh({ silent: true }).then(sweepNotifications, () => {}); sweepNotifications(); } });
+// The Windows app's page is never hidden: WebView2 is not told when its window is hidden (tauri-runtime-wry hides the
+// window, not the web view), so no visibilitychange came when the window came back, and the taskbar count and the list caught up only at
+// the next 60 s poll. The field log of 2026-11-25 has the count 20 at 17:23:06 for mail handled on the phone at 17:22:08-48, 15 a minute
+// later, and the Windows speed report not one resume in 19.6 h. The window coming back to the front after 5 s away now does what coming
+// back into view does; where a visibilitychange already did it in the same moment (the Mac, a browser tab) it is not done twice. Focus
+// moving into the mail's own frame is not leaving: the document still has focus then.
+{ let leftAt = 0, viewAt = 0;
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) viewAt = Date.now(); });
+  addEventListener("blur", () => { setTimeout(() => { if (!document.hasFocus()) leftAt = Date.now(); }, 0); });
+  addEventListener("focus", () => { const away = leftAt ? Date.now() - leftAt : 0; leftAt = 0; if (away < 5000) return;
+    setTimeout(() => { if (Date.now() - viewAt < 1500 || document.hidden) return; perf.record("resume:focus-away-ms", away); adoptOnResume(); refresh({ silent: true }).then(sweepNotifications, () => {}); sweepNotifications(); }, 250); }); }
 // Field evidence for the hidden Mac window: macOS may SUSPEND a hidden WKWebView page (inactiveSchedulingPolicy defaults to suspend
 // for apps built on recent SDKs) rather than throttle it, and a suspended page can neither take the mail the native side hands it nor
 // be ready when the window comes back. A 1 s heartbeat tells them apart: after a suspension the longest gap between beats while hidden
@@ -5893,4 +6020,4 @@ async function ensureThreadLocal(acc, th) {
 })();
 
 // debug hook (also handy in the browser console)
-window.mh = { warmPictures, syncDrafts, draftStore, editors, openDraft, draftFlush, idb, openThread, openCompose, openFind, closeFind, findStep, findState: find, actedElsewhere, imgDims, syncImgDims, applyImgDims, syncTrackers, urlHash, attOpen, attDownload, attRisk, attExpect, attSniff, attView, quoteSplitText, quoteSplitHtml, THREAD_ACTIONS, actionKey, gmailDelta, adapterFor, applyLocal, plainOf, openSettings, closeSettings, openImapForm, attHref, messageHtml, fillTrustAges, ensureThreadLocal, acceptStash, importNow, primeStashes, openUrl: (url) => { const u = new URL(url, location.origin); history.replaceState(history.state, "", u.pathname + u.search); return handleParams(); }, gmailTokens, contactBook, buildContactBook, parseAddrList, update, updateSafe, checkVersion, applyUpdate, sendSpeedReport, setImgPass, proxyImages, snapshot, idb, searchMore, serverSearch, applyLocal, queueSend, ask, askText, state, refresh, render, act, isHubCopy, mirrorHubCopies, catOf, prefs, visibleThreads, openThread, setView, perf, queue, localAct, prerendered, prefetchBodies, searchIndex, ensureSearch, backfillBodyIndex, openPalette, paletteCommands, fillVars, mdToHtml, buildMime, senderRule, focusReply, openMenuFor: (t) => openMenu({ target: document.body }, t), bootstrapAll, dropRowNode, writeSnapshotNow, markSnapshotDirty, pushLive, notePushMissed, notePushDelivered, pushLayer, dropLayer, closeMenu, layers, back: backLayer, bulk, bulkUndo, selectAll, selectFromHere, setFocus, counts, backfillUnsub, UNSUB_BACKFILL, refreshRowFromBodies, cachedThread, hub, syncHub, flushDeferredDeletes, threadFor, adoptServerRow, openExternal, chromeIntent, dismissNotifications, sweepNotifications, noteHandled, flushHandled, noteEndpoint, warmEndpoint, androidApp, syncPushSubscription, myPushId, pushOptOut, setPushOptOut, pushedThread, sweepPushStash, adoptPushStashes, rowFromStash };
+window.mh = { warmPictures, forwardDraft, syncDrafts, draftStore, editors, openDraft, draftFlush, idb, openThread, openCompose, openFind, closeFind, findStep, findState: find, actedElsewhere, imgDims, syncImgDims, applyImgDims, syncTrackers, urlHash, attOpen, attDownload, attRisk, attExpect, attSniff, attView, quoteSplitText, quoteSplitHtml, THREAD_ACTIONS, actionKey, gmailDelta, adapterFor, applyLocal, plainOf, openSettings, closeSettings, openImapForm, attHref, messageHtml, fillTrustAges, ensureThreadLocal, acceptStash, importNow, primeStashes, openUrl: (url) => { const u = new URL(url, location.origin); history.replaceState(history.state, "", u.pathname + u.search); return handleParams(); }, gmailTokens, contactBook, buildContactBook, parseAddrList, update, updateSafe, checkVersion, applyUpdate, sendSpeedReport, setImgPass, proxyImages, snapshot, idb, searchMore, serverSearch, applyLocal, queueSend, ask, askText, state, refresh, render, act, isHubCopy, mirrorHubCopies, catOf, prefs, visibleThreads, openThread, setView, perf, queue, localAct, prerendered, prefetchBodies, searchIndex, ensureSearch, backfillBodyIndex, openPalette, paletteCommands, fillVars, mdToHtml, buildMime, senderRule, focusReply, openMenuFor: (t) => openMenu({ target: document.body }, t), bootstrapAll, dropRowNode, writeSnapshotNow, markSnapshotDirty, pushLive, notePushMissed, notePushDelivered, pushLayer, dropLayer, closeMenu, layers, back: backLayer, bulk, bulkUndo, selectAll, selectFromHere, setFocus, counts, backfillUnsub, UNSUB_BACKFILL, refreshRowFromBodies, cachedThread, hub, syncHub, flushDeferredDeletes, threadFor, adoptServerRow, openExternal, chromeIntent, dismissNotifications, sweepNotifications, noteHandled, flushHandled, noteEndpoint, warmEndpoint, androidApp, syncPushSubscription, myPushId, pushOptOut, setPushOptOut, pushedThread, sweepPushStash, adoptPushStashes, rowFromStash };

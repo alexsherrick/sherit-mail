@@ -1,7 +1,7 @@
 # Sherit Mail for Windows: a native shell around the web client at mail.yourdomain.example. Build with../build.sh.
 [package]
 name = "sherit-mail"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 publish = false
 

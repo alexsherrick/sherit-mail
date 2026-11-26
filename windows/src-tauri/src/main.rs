@@ -14,7 +14,8 @@ use crate::applog::log;
 use crate::core::{Cmd, HUB, HUB_HOST};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::image::Image;
@@ -24,6 +25,37 @@ use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, RunEvent, Theme, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Where a launch's time goes. The Windows speed report has 746 ms between the page's navigation start and its first
+/// request (fetchStart), which the Mac (0) and Android (55 ms) do not have, and nothing inside the page can say what WebView2 does then.
+/// SmartScreen is not it: wry starts WebView2 with msSmartScreenProtection disabled. The launch's steps are logged with the
+/// milliseconds since the process started (the first 40), and every main-frame navigation's steps with the milliseconds since it
+/// started; the field log (GET /api/applog?device=windows) carries them to the hub.
+static START: OnceLock<Instant> = OnceLock::new();
+static MARKS: AtomicUsize = AtomicUsize::new(0);
+static NAV_AT: Mutex<Option<Instant>> = Mutex::new(None);
+pub fn launch_mark(what: &str) {
+    if MARKS.fetch_add(1, Ordering::SeqCst) >= 40 {
+        return;
+    }
+    let ms = START.get().map(|s| s.elapsed().as_millis()).unwrap_or(0);
+    let nav = NAV_AT.lock().ok().and_then(|n| *n).map(|n| format!(", nav +{} ms", n.elapsed().as_millis())).unwrap_or_default();
+    log(format!("launch +{ms} ms {what}{nav}"));
+}
+/// A main-frame navigation's step: logged every time (a launch, an update's reload, a crash's reload), the launch's first 40 also as
+/// launch marks.
+pub fn nav_mark(what: &str, starting: bool) {
+    if starting {
+        if let Ok(mut n) = NAV_AT.lock() {
+            *n = Some(Instant::now());
+        }
+    }
+    if MARKS.load(Ordering::SeqCst) < 40 {
+        return launch_mark(what);
+    }
+    let since = NAV_AT.lock().ok().and_then(|n| *n).map(|n| n.elapsed().as_millis()).unwrap_or(0);
+    log(format!("nav +{since} ms {what}"));
+}
 const TRAY_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const ICON_PNG: &[u8] = include_bytes!("../icons/128x128.png");
 
@@ -78,6 +110,7 @@ pub struct Shared {
 }
 
 fn main() {
+    START.get_or_init(Instant::now);
     win::early_init();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let app = tauri::Builder::default()
@@ -110,6 +143,7 @@ fn main() {
 fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = app.path().app_data_dir()?;
     applog::init(app.path().app_log_dir()?);
+    launch_mark(&format!("setup (Sherit Mail {VERSION}, WebView2 {})", win::webview_version()));
     let mut p = Persist::load(&data_dir);
     if p.link_key.is_empty() {
         p.link_key = core::random_token(24);
@@ -159,7 +193,9 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     win::set_login_item(&exe, login);
 
     build_tray(app, login)?;
+    launch_mark("window: building");
     build_window(app, hidden)?;
+    launch_mark("window: built");
     win::jump_list(&exe);
     handle_launch(app, args, true);
     notifier::start(app.clone());
@@ -264,8 +300,12 @@ fn build_window(app: &AppHandle, hidden: bool) -> tauri::Result<WebviewWindow> {
         .on_page_load(move |_, p| {
             let sh = a4.state::<Shared>();
             match p.event() {
-                PageLoadEvent::Started => sh.loaded.store(false, Ordering::SeqCst),
+                PageLoadEvent::Started => {
+                    sh.loaded.store(false, Ordering::SeqCst);
+                    nav_mark(&format!("page load started {}", p.url().path()), false);
+                }
                 PageLoadEvent::Finished => {
+                    nav_mark(&format!("page load finished {}", p.url().path()), false);
                     let on_hub = p.url().host_str() == Some(HUB_HOST);
                     sh.loaded.store(on_hub, Ordering::SeqCst);
                     log(format!("loaded {}{}", p.url().path(), if on_hub { "" } else { " (not the hub)" }));
@@ -287,6 +327,7 @@ fn build_window(app: &AppHandle, hidden: bool) -> tauri::Result<WebviewWindow> {
     if !hidden {
         let _ = w.show();
         let _ = w.set_focus();
+        launch_mark("window shown");
     }
     Ok(w)
 }
@@ -294,6 +335,9 @@ fn build_window(app: &AppHandle, hidden: bool) -> tauri::Result<WebviewWindow> {
 /// Main-frame navigations. The hub's own pages stay; Google sign-in goes to the real browser (Google refuses embedded web
 /// views: disallowed_useragent); connecting a Gmail account too (its tokens live on the hub); everything else leaves the app.
 fn navigate(app: &AppHandle, url: &url::Url) -> bool {
+    if url.host_str() == Some(HUB_HOST) {
+        nav_mark(&format!("navigation starting {}", url.path()), true);
+    }
     match url.scheme() {
         "about" | "blob" | "data" => true,
         "http" | "https" if url.host_str() == Some(HUB_HOST) => {
@@ -534,6 +578,10 @@ fn window_event(w: &tauri::Window, ev: &WindowEvent) {
 
 #[tauri::command]
 fn badge(app: AppHandle, n: u32) {
+    static FIRST: AtomicBool = AtomicBool::new(true);
+    if FIRST.swap(false, Ordering::SeqCst) {
+        launch_mark("page script running (its first badge)");
+    }
     let sh = app.state::<Shared>();
     if sh.unread.swap(n, Ordering::SeqCst) == n {
         return;

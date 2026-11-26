@@ -555,14 +555,13 @@ async function unsubNoteArrival(db, jobs, addr, subject, atMs, ref) {
 // Each hop of a picture fetch, body included, ends after 20 s: a sender that drips its bytes held an arrival or the cron's drain past its
 // own budget, which is checked only between pictures.
 const IMG_FETCH_MS = 20_000;
-async function fetchImageSafely(u, max = IMG_MAX) {
+const FETCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+// One GET of a sender's file with every redirect hop checked like the first (at most 3): { up } or { ok: false, status, msg }.
+async function fetchHops(u, accept) {
   let up, hops = 0, cur = u;
   while (true) {
-    try {
-      // `*/*` last, as every browser sends it: HubSpot's CTA images (hsctaimages.net) answer 406 to an Accept without it and redirect to
-      // the PNG with it. What comes back must still be an image: the content type and first bytes are checked below.
-      up = await fetch(cur.href, { redirect: "manual", signal: AbortSignal.timeout(IMG_FETCH_MS), headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15", "Accept": "image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8,*/*;q=0.5" } });
-    } catch (e) { return { ok: false, status: 502, msg: "upstream error" }; }
+    try { up = await fetch(cur.href, { redirect: "manual", signal: AbortSignal.timeout(IMG_FETCH_MS), headers: { "User-Agent": FETCH_UA, "Accept": accept } }); }
+    catch (e) { return { ok: false, status: 502, msg: "upstream error" }; }
     if ([301, 302, 303, 307, 308].includes(up.status)) {
       if (++hops > 3) return { ok: false, status: 502, msg: "too many redirects" };
       let nx; try { nx = new URL(up.headers.get("location") || "", cur); } catch (_) { return { ok: false, status: 502, msg: "bad redirect" }; }
@@ -572,12 +571,30 @@ async function fetchImageSafely(u, max = IMG_MAX) {
     break;
   }
   if (!up.ok) return { ok: false, status: 502, msg: "upstream " + up.status };
+  return { up, url: cur };
+}
+// A font is a font by its first bytes alone, whatever type its host sends: WOFF2, WOFF, OpenType (CFF), TrueType
+// (0x00010000, or 'true' from older Apple fonts) or a collection. A page, a stylesheet or an image at a font's URL is none of them.
+const sniffFont = (b) => (b.byteLength >= 12 && (
+  b[0] === 0x77 && b[1] === 0x4f && b[2] === 0x46 && b[3] === 0x32 ? "font/woff2" :
+  b[0] === 0x77 && b[1] === 0x4f && b[2] === 0x46 && b[3] === 0x46 ? "font/woff" :
+  b[0] === 0x4f && b[1] === 0x54 && b[2] === 0x54 && b[3] === 0x4f ? "font/otf" :
+  (b[0] === 0x00 && b[1] === 0x01 && b[2] === 0x00 && b[3] === 0x00) || (b[0] === 0x74 && b[1] === 0x72 && b[2] === 0x75 && b[3] === 0x65) ? "font/ttf" :
+  b[0] === 0x74 && b[1] === 0x74 && b[2] === 0x63 && b[3] === 0x66 ? "font/collection" : null)) || null;
+const IMG_ACCEPT = "image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8,*/*;q=0.5", FONT_ACCEPT = "font/woff2,font/woff,font/otf,font/ttf,*/*;q=0.5";
+// `o.font`: the file must be a font instead (sniffFont), its declared type never believed.
+async function fetchImageSafely(u, max = IMG_MAX, o = {}) {
+  // `*/*` last, as every browser sends it: HubSpot's CTA images (hsctaimages.net) answer 406 to an Accept without it and redirect to
+  // the PNG with it. What comes back must still be an image: the content type and first bytes are checked below.
+  const got0 = await fetchHops(u, o.font ? FONT_ACCEPT : IMG_ACCEPT);
+  if (!got0.up) return got0;
+  const up = got0.up;
   let ct = (up.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
   // Any type but one of these is not believed either way: the magic number decides, and the picture is served as what its bytes are.
   // Some hosts send no type (one sender's image host), and some the wrong one: a school district's mail host serves its PNG
   // logo as application/x-www-form-urlencoded and a clinic's CDN as "undefined", which browsers draw and the hub refused.
   // An SVG, a font, a page or a stylesheet still has no image magic number, and is still "not an image".
-  const generic = !/^image\/(png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)$/.test(ct);
+  const generic = o.font || !/^image\/(png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)$/.test(ct);
   const declared = parseInt(up.headers.get("content-length") || "0", 10);
   if (declared > max) return { ok: false, status: 413, msg: "too large" };
   // Stream through a counting transform: nothing is buffered, the stream is aborted past `max`, and the first bytes must
@@ -592,11 +609,12 @@ async function fetchImageSafely(u, max = IMG_MAX) {
     b[0] === 0x42 && b[1] === 0x4d ? "image/bmp" :
     b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 && /^(avif|avis|mif1|miaf)$/.test(String.fromCharCode(b[8], b[9], b[10], b[11])) ? "image/avif" :
     b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00 ? "image/x-icon" : null)) || null;
+  const sniff = o.font ? sniffFont : sniffImage, refused = o.font ? "not a font" : "not an image";
   let body = up.body;
   if (generic) { // no usable declared type: read the first bytes, decide from the magic number, and put them back in front of the stream
     const reader = up.body.getReader(); let head0 = new Uint8Array(0);
     while (head0.byteLength < 12) { const { value, done } = await reader.read(); if (done) break; const m = new Uint8Array(head0.byteLength + value.byteLength); m.set(head0, 0); m.set(value, head0.byteLength); head0 = m; }
-    const sniffed = sniffImage(head0); if (!sniffed) { try { await reader.cancel(); } catch (_) {} return { ok: false, status: 415, msg: "not an image" }; }
+    const sniffed = sniff(head0); if (!sniffed) { try { await reader.cancel(); } catch (_) {} return { ok: false, status: 415, msg: refused }; }
     ct = sniffed;
     body = new ReadableStream({ start(c) { c.enqueue(head0); }, async pull(c) { const { value, done } = await reader.read(); if (done) c.close(); else c.enqueue(value); }, cancel() { try { reader.cancel(); } catch (_) {} } });
   }
@@ -609,12 +627,12 @@ async function fetchImageSafely(u, max = IMG_MAX) {
         const merged = new Uint8Array(head.byteLength + chunk.byteLength); merged.set(head, 0); merged.set(chunk, head.byteLength); head = merged;
         if (head.byteLength < 12) return;               // keep accumulating until the magic number is decidable
         checked = true;
-        if (!sniffImage(head)) { controller.error(new Error("not an image")); return; }
+        if (!sniff(head)) { controller.error(new Error(refused)); return; }
         controller.enqueue(head); return;
       }
       controller.enqueue(chunk);
     },
-    flush(controller) { if (!checked) { if (head.byteLength && !sniffImage(head)) controller.error(new Error("not an image")); else if (head.byteLength) controller.enqueue(head); } },
+    flush(controller) { if (!checked) { if (head.byteLength && !sniff(head)) controller.error(new Error(refused)); else if (head.byteLength) controller.enqueue(head); } },
   });
   return { ok: true, ct, len: declared, body: body.pipeThrough(counter) };
 }
@@ -719,6 +737,13 @@ function imgSeen(env, sha) {
     .bind(sha, now(), now(), day).run().catch(() => {})); } catch (_) {}
 }
 const imgResponse = (body, ct, via, cc = IMG_CC_ORIGINAL) => new Response(body, { headers: { "content-type": ct, "cache-control": cc, "x-content-type-options": "nosniff", "content-security-policy": "sandbox; default-src 'none'", "x-img-source": via } });
+// What R2 holds under a picture's key, answered: a picture as an original (it may yet be replaced by its sizes), a font for a year (it never
+// is), and a mail's kept stylesheet never: GET /api/fontcss answers those, rewritten, and no image or font load does.
+function keptResponse(obj, via) {
+  const ct = obj.httpMetadata?.contentType || "application/octet-stream";
+  if (ct === "text/css") { try { obj.body?.cancel(); } catch (_) {} return new Response(null, { status: 404, headers: { "x-img-source": "not-a-picture", "cache-control": "no-store" } }); }
+  return imgResponse(obj.body, ct, via, /^font\//.test(ct) ? IMG_CC_SIZED : IMG_CC_ORIGINAL);
+}
 const edgeCopy = (res) => { const r = new Response(res.body, res); r.headers.set("cache-control", "public, max-age=86400"); return r; };
 // ---------- arrival-time image prefetch ----------
 // When mail arrives the hub fetches the images the client would ask /api/img for and keeps them in R2, so an open never reaches the
@@ -879,10 +904,133 @@ function prefetchUrlsOf(h) {
   attr("srcset", (v) => { for (const c of srcsetCandidates(v)) px(c.url); }, "img|source|td|th|table|body|div");
   // A URL stops at the next `url(`: a run of unclosed `url(//` was read from each one to its end (1 MB: 155 s).
   const CSS_URL = /url\(\s*(['"]?)((?:https?:)?\/\/(?:(?!url\()[^)'"])+)\1\s*\)/gi;
-  const rest = dropBlocks(h, "style", (css) => { for (const m of css.matchAll(CSS_URL)) add(m[2].trim()); return " "; });
+  // A font or an imported stylesheet is not a picture: fontPlan() reads them, and they were 490 of the queue's 548
+  // given-up rows on 2026-11-25, each downloaded again with every mail that named it.
+  const rest = dropBlocks(h, "style", (css) => { for (const m of cssFontless(css).matchAll(CSS_URL)) add(m[2].trim()); return " "; });
   for (const m of rest.matchAll(CSS_URL)) add(htmlUnent(m[2].trim()));
   return [...out];
 }
+// ---------- a mail's own fonts ----------
+// Kept like its pictures, so the mail is drawn in the type it was designed in, as Apple Mail draws it (Gmail, Outlook.com and Yahoo
+// never load a web font: caniemail.com, @font-face). On 2026-11-25, 94 of one account's 282 HTML mails in 21 days declared fonts in their
+// own <style>, 42 linked a stylesheet for them (Google Fonts mostly) and 17 imported one. They are fetched when the mail arrives, with
+// its pictures and under the same day's allowance and sender's share, and never when it is opened: a font says nothing about when a
+// mail was read. The viewer's frame takes fonts from /api/img alone and stylesheets from /api/fontcss alone (client/app.js frameDoc).
+//  - faces: the @font-face rules of the mail's <style> elements and of the stylesheets it links (<link rel=stylesheet>) or imports
+//  (@import), with comments dropped as the browser drops them (so nothing inside an Outlook-only <!--[if mso]> block);
+//  - only a face the mail can use: its family is one the mail's own styles name (font-family, font, <font face>), and its unicode-range,
+//  when it has one, covers a character of the mail's text. Google's css2 lists a face per script (cyrillic, greek, vietnamese...)
+//  and the browser downloads only those its text needs, so the hub keeps only those too;
+//  - one file a face: the first src the browser would take (woff2, woff, truetype, opentype or a collection, or a URL with no format
+//  that is not an EOT or SVG file), so nothing behind it in the list is fetched;
+//  - a stylesheet is kept as its usable faces alone, each with its one URL absolute and font-display: fallback, and nothing else: no
+//  other rule and no @import of its own (a Typekit kit imports a usage ping, p.typekit.net);
+//  - a font is a font by its bytes (sniffFont), at most 2 MB; at most 6 stylesheets (256 KB each) and 24 fonts a mail.
+const FONT_MAX = 2 * 1024 * 1024, FONT_SHEET_MAX = 256 * 1024, FONTS_PER_MAIL = 24, SHEETS_PER_MAIL = 6;
+const FONT_FMT = /^(woff2|woff|truetype|opentype|collection)(-variations)?$/;
+const CSS_IMPORT = /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)|"([^"]*)"|'([^']*)')[^;{}]*;?/gi;
+const cssNoComments = (css) => String(css ?? "").replace(/\/\*[\s\S]*?(?:\*\/|$)/g, " ");
+const cssFontless = (css) => String(css ?? "").replace(/@font-face\s*\{[^{}]*\}/gi, " ").replace(CSS_IMPORT, " ");
+const cssUnquote = (s) => String(s ?? "").trim().replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+// "U+0000-00FF, U+0131, U+4??" -> [[0, 255], [305, 305], [1024, 1279]]; null when there is none to read (the face covers everything)
+function unicodeRanges(v) {
+  const out = [];
+  for (const m of String(v ?? "").matchAll(/u\+([0-9a-f?]{1,6})(?:-([0-9a-f]{1,6}))?/gi)) {
+    if (m[1].includes("?")) { out.push([parseInt(m[1].replace(/\?/g, "0"), 16), parseInt(m[1].replace(/\?/g, "f"), 16)]); continue; }
+    const lo = parseInt(m[1], 16), hi = m[2] ? parseInt(m[2], 16) : lo; if (hi >= lo) out.push([lo, hi]);
+  }
+  return out.length ? out : null;
+}
+// The declarations of one @font-face body, by name (lowercased), in order.
+const fontDecls = (body) => String(body).split(";").map((d) => { const i = d.indexOf(":"); return i > 0 ? [d.slice(0, i).trim().toLowerCase(), d.slice(i + 1).trim()] : null; }).filter((d) => d && d[0] && d[1]);
+// The @font-face rules of a style sheet: { family (lowercased), src (the one URL the hub fetches, absolute, or null), fmt, range, decls }.
+// `base` resolves a stylesheet's relative url(); a mail's own <style> has no base the viewer would use, so only an absolute or // URL
+// counts there, and the browser, as here, goes on to the next candidate.
+export function fontFaces(css, base = null) {
+  const out = [];
+  for (const m of cssNoComments(css).matchAll(/@font-face\s*\{([^{}]*)\}/gi)) {
+    const decls = fontDecls(m[1]), get = (n) => (decls.find((d) => d[0] === n) || [])[1] || "";
+    let src = null, fmt = "";
+    for (const c of get("src").matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)\s*(?:format\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\))?/gi)) {
+      const raw = (c[1] ?? c[2] ?? c[3] ?? "").trim(), f = (c[4] ?? c[5] ?? c[6] ?? "").trim().toLowerCase();
+      if (!raw || (f ? !FONT_FMT.test(f) : /\.(eot|svgz?)(?:[?#]|$)/i.test(raw))) continue;   // a format the browser skips
+      if (/^data:/i.test(raw)) break;   // the browser takes the font the mail carries: nothing to fetch
+      let u = null; try { u = base ? new URL(raw, base) : /^(https?:)?\/\//i.test(raw) ? new URL(/^\/\//.test(raw) ? "https:" + raw : raw) : null; } catch (_) {}
+      if (!u || !/^https?:$/.test(u.protocol) || u.href.length > 2048) continue;
+      src = u.href; fmt = f; break;
+    }
+    out.push({ family: cssUnquote(get("font-family")).toLowerCase(), src, fmt, range: unicodeRanges(get("unicode-range")), decls });
+  }
+  return out;
+}
+// What a mail can use a face for: the families its own styles name and the characters of its text (sorted code points, at most 4,000).
+export function fontUse(html) {
+  const h = dropComments(String(html ?? "")), fam = new Set(), styles = [];
+  const add = (list) => { for (const f of String(list).replace(/!important/gi, "").split(",")) { const n = cssUnquote(f).toLowerCase(); if (n) fam.add(n); } };
+  const body = dropBlocks(h, "style", (css) => { styles.push(cssFontless(cssNoComments(css))); return " "; });
+  const css = styles.join("\n") + "\n" + [...body.matchAll(/[\s"']style\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)].map((m) => htmlUnent(m[1] ?? m[2])).join(";\n");
+  for (const m of css.matchAll(/(?:^|[;{\s])font-family\s*:\s*([^;}]*)/gi)) add(m[1]);
+  // `font: [style weight...] size[/line-height] family,...`: the families follow the last size, a length or a size keyword
+  for (const m of css.matchAll(/(?:^|[;{\s])font\s*:\s*([^;}]*)/gi)) { const f = /^(?:.*\s)?(?:[\d.]+[a-z%]*|(?:xx?-)?(?:small|large)|medium|smaller|larger)(?:\s*\/\s*[\w.%]+)?\s+(.+)$/i.exec(m[1].trim()); if (f) add(f[1]); }
+  for (const m of body.matchAll(/<font\b[^<>]*?[\s"']face\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) add(htmlUnent(m[1] ?? m[2] ?? m[3]));
+  const cps = new Set();
+  for (const ch of htmlUnent(pageText(h)).slice(0, 200_000)) { cps.add(ch.codePointAt(0)); if (cps.size >= 4000) break; }
+  return { families: fam, cps: [...cps].sort((a, b) => a - b) };
+}
+// For a stylesheet fetched with no mail at hand (the minute cron's retry): every family, the characters of English text.
+const FONT_USE_LATIN = { families: new Set(), cps: Array.from({ length: 95 }, (_, i) => 32 + i) };
+const fontWanted = (face, use) => !!face.src && (!use.families.size || use.families.has(face.family)) &&
+  (!face.range || face.range.some(([a, b]) => { let lo = 0, hi = use.cps.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (use.cps[mid] < a) lo = mid + 1; else hi = mid; } return lo < use.cps.length && use.cps[lo] <= b; }));
+// The stylesheets a mail links or imports, and the faces its own <style> declares: what its fonts need fetched when it arrives.
+export function fontPlan(html) {
+  const h = dropComments(String(html ?? "")), sheets = [], styles = [];
+  const sheet = (raw) => { const v = String(raw ?? "").trim(); if (!/^(https?:)?\/\//i.test(v)) return; let u; try { u = new URL(/^\/\//.test(v) ? "https:" + v : v); } catch (_) { return; }
+    if (/^https?:$/.test(u.protocol) && u.href.length <= 2048 && !sheets.includes(u.href) && sheets.length < SHEETS_PER_MAIL) sheets.push(u.href); };
+  const rest = dropBlocks(h, "style", (css) => { styles.push(cssNoComments(css)); return " "; });
+  const attr = (tag, name) => { const m = new RegExp(ATTR_AT + name + "\\s*=\\s*" + TAG_VAL, "i").exec(tag); return m ? htmlUnent(m[2] ?? m[3] ?? m[4] ?? "") : ""; };
+  for (const tag of rest.match(/<link\b[^<>]*>/gi) || []) { const rel = ` ${attr(tag, "rel").toLowerCase()} `; if (/\sstylesheet\s/.test(rel) && !/\salternate\s/.test(rel)) sheet(attr(tag, "href")); }
+  for (const css of styles) for (const m of css.matchAll(CSS_IMPORT)) sheet(m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]);
+  return { sheets, faces: styles.flatMap((css) => fontFaces(css)), use: fontUse(h) };
+}
+// A @font-face rule as the hub serves it: its own descriptors, src cut to the one URL kept, font-display: fallback (text waits at most
+// ~100 ms for the font, then shows in the mail's next font and takes this one if it comes within 3 s, never invisible for seconds).
+const fontRule = (face) => `@font-face{${face.decls.filter(([n]) => n !== "src" && n !== "font-display" && /^[a-z-]+$/.test(n)).map(([n, v]) => `${n}:${v.replace(/[{}<>]/g, "")}`).join(";")};src:url("${face.src.replace(/["\\\n\r]/g, (c) => encodeURIComponent(c))}")${face.fmt ? ` format("${face.fmt}")` : ""};font-display:fallback}`;
+// A fetched stylesheet as the hub keeps it: { css: its usable faces as fontRule() writes them, fonts: their URLs }.
+export function fontSheetKept(text, base, use) {
+  const faces = fontFaces(text, base).filter((f) => fontWanted(f, use));
+  return { css: faces.map(fontRule).join("\n"), fonts: [...new Set(faces.map((f) => f.src))] };
+}
+// A stylesheet, fetched as a picture is (every redirect checked), read as text up to FONT_SHEET_MAX: { ok, text } or { ok: false, status, msg }.
+async function fetchSheetSafely(u) {
+  const got0 = await fetchHops(u, "text/css,*/*;q=0.1"); if (!got0.up) return got0;
+  const declared = parseInt(got0.up.headers.get("content-length") || "0", 10);
+  if (declared > FONT_SHEET_MAX) { try { await got0.up.body?.cancel(); } catch (_) {} return { ok: false, status: 413, msg: "too large" }; }
+  const reader = got0.up.body.getReader(), parts = []; let n = 0;
+  try { for (;;) { const { value, done } = await reader.read(); if (done) break; n += value.byteLength; if (n > FONT_SHEET_MAX) { try { await reader.cancel(); } catch (_) {} return { ok: false, status: 413, msg: "too large" }; } parts.push(value); } }
+  catch (_) { return { ok: false, status: 502, msg: "stream cut" }; }
+  const bytes = new Uint8Array(n); let at = 0; for (const p of parts) { bytes.set(p, at); at += p.byteLength; }
+  if (bytes.subarray(0, 1024).includes(0)) return { ok: false, status: 415, msg: "not a stylesheet" };   // binary
+  return { ok: true, text: new TextDecoder().decode(bytes), url: got0.url };   // url: where it was found, which its own url()s are relative to
+}
+// A mail's stylesheet as kept: { ok, css, fonts } or a failure. A sheet with no @font-face of its own that imports others (one brand's
+// latest.css is a single line, an @import of its versioned font.css) is read one level down, at most 3 imports, each checked like the
+// first and its url()s resolved against itself. A sheet with faces of its own is never followed: a Typekit kit's only import is its
+// usage ping (p.typekit.net/p.css).
+async function fetchFontSheet(u, use) {
+  const got = await fetchSheetSafely(u); if (!got.ok) return got;
+  const parts = [got];
+  if (!/@font-face/i.test(cssNoComments(got.text))) {
+    for (const m of [...cssNoComments(got.text).matchAll(CSS_IMPORT)].slice(0, 3)) {
+      let v = null; try { v = new URL(m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? "", got.url); } catch (_) {}
+      if (!v || !/^https?:$/.test(v.protocol) || v.href.length > 2048 || spyTrackerName(v.href) || badHost(v.hostname) || (await resolvesPrivate(v.hostname))) continue;
+      const g2 = await fetchSheetSafely(v); if (g2.ok) parts.push(g2);
+    }
+  }
+  const kept = parts.map((p) => fontSheetKept(p.text, p.url.href, use));
+  return { ok: true, css: kept.map((k) => k.css).filter(Boolean).join("\n"), fonts: [...new Set(kept.flatMap((k) => k.fonts))] };
+}
+// The URLs of the fonts a kept stylesheet names (what fontRule wrote).
+const fontSheetFonts = (css) => [...String(css).matchAll(/src:url\("([^"]+)"\)/g)].map((m) => m[1]);
 // `o.deadline` (epoch ms) ends this mail's fetching early when it shares a waitUntil with others (prefetchGmail); `o.left` is the day's
 // remaining allowance (prefetchAllowance), shared and drawn down across a batch.
 // ---------- the picture queue (migration 0048) ----------
@@ -898,8 +1046,12 @@ const isoIn = (ms) => new Date(Date.now() + ms).toISOString();
 // `fill` marks a picture queued to catch up old mail: the mirror's picture fill, or a backfill. The drain takes it only
 // after the pictures new mail is waiting for, and only while more than half of the day and of its sender's share is left. New mail
 // wanting the same picture makes it new mail's (MIN).
-const imgQueueAhead = (db, href, fetchingUntil, org = null, fill = 0) => db.prepare("INSERT INTO img_queue (hk, url, state, kind, tries, next_at, fetching_until, at, dom, fill) VALUES (?, ?, 'pending', 'new', 0, ?, ?, ?, ?, ?) ON CONFLICT(hk) DO UPDATE SET state = 'pending', fetching_until = excluded.fetching_until, next_at = MAX(next_at, excluded.next_at), dom = COALESCE(excluded.dom, img_queue.dom), at = excluded.at, fill = MIN(img_queue.fill, excluded.fill)")
-  .bind(urlHash(href), href, isoIn(fetchingUntil ? 120e3 : 0), fetchingUntil, now(), org, fill ? 1 : 0);
+// `what` (migration 0055): null for a picture, "font" for a mail's font, "css" for a stylesheet its fonts are named in.
+// A row given up as "not an image" before fonts were kept (a font read as a picture) is a font from then on.
+const imgQueueAhead = (db, href, fetchingUntil, org = null, fill = 0, what = null) => db.prepare("INSERT INTO img_queue (hk, url, state, kind, tries, next_at, fetching_until, at, dom, fill, what) VALUES (?, ?, 'pending', 'new', 0, ?, ?, ?, ?, ?, ?) ON CONFLICT(hk) DO UPDATE SET state = 'pending', fetching_until = excluded.fetching_until, next_at = MAX(next_at, excluded.next_at), dom = COALESCE(excluded.dom, img_queue.dom), at = excluded.at, fill = MIN(img_queue.fill, excluded.fill), tries = CASE WHEN excluded.what IS NOT NULL AND img_queue.what IS NULL THEN 0 ELSE img_queue.tries END, what = COALESCE(excluded.what, img_queue.what)")
+  .bind(urlHash(href), href, isoIn(fetchingUntil ? 120e3 : 0), fetchingUntil, now(), org, fill ? 1 : 0, what);
+// The row that keeps a stored font or stylesheet 90 days from its last showing, as a picture's does (sweepImgs).
+const imgSeenRow = (db, key) => db.prepare("INSERT INTO img_seen (sha, stored_at) VALUES (?, ?) ON CONFLICT(sha) DO NOTHING").bind(key.slice(4), now());
 // A held picture that comes in again with new mail starts its 90 days again: the sweep counts from the later of the last showing and the
 // storing (COALESCE(seen_at, stored_at)), and a picture stored three months ago and never shown was swept, so the NEW mail's open fetched
 // it from its sender. Arriving again counts as a showing.
@@ -914,12 +1066,39 @@ function imgQueueFailed(db, href, { big = false, permanent = false, note = "" } 
   return db.prepare("UPDATE img_queue SET kind = ?, tries = tries + 1, state = CASE WHEN ? = 1 OR tries + 1 >= 4 THEN 'dead' ELSE 'pending' END, next_at = CASE WHEN ? = 1 THEN ? WHEN tries + 1 = 1 THEN ? WHEN tries + 1 = 2 THEN ? ELSE ? END, fetching_until = NULL, note = ?, last_at = ? WHERE hk = ?")
     .bind(big ? "big" : "fail", permanent ? 1 : 0, big ? 1 : 0, isoIn(60e3), isoIn(IMG_RETRY_MS[0]), isoIn(IMG_RETRY_MS[1]), isoIn(IMG_RETRY_MS[2]), String(note || "failed").slice(0, 80), now(), urlHash(href));
 }
+// One arriving mail's stylesheets, fetched together: each is kept as fontSheetKept() leaves it, under img/<sha of its
+// URL> as text/css (which /api/img never serves; GET /api/fontcss does), counted in the day's allowance and the sender's share like a
+// picture; one already held is read back. Answers the fonts they name. A failed one keeps its queue row for the cron, which reads it for
+// English text (FONT_USE_LATIN), having no mail at hand.
+async function prefetchFontSheets(env, sheets, use, { org, busy, left, mine, r, queue }) {
+  const db = env.DB, fonts = [];
+  try { await db.batch(sheets.map((h) => imgQueueAhead(db, h, busy, org, 0, "css"))); } catch (_) {}
+  await Promise.all(sheets.map(async (href) => {
+    try {
+      const key = await imgKey(href), held = await env.STORE.get(key).catch(() => null);
+      if (held) { const css = held.httpMetadata?.contentType === "text/css" ? await held.text() : ""; r.had++; queue.push(imgQueueDone(db, href), imgTouchRow(db, key)); fonts.push(...fontSheetFonts(css)); return; }
+      if (left.images <= 0 || left.bytes <= 0 || mine.images <= 0 || mine.bytes <= 0) { r.over++; queue.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
+      let u = null; try { u = new URL(href); } catch (_) {}
+      if (!u || spyTrackerName(u.href) || badHost(u.hostname) || (await resolvesPrivate(u.hostname))) { r.failed++; queue.push(imgQueueDone(db, href)); return; }
+      const kept = await fetchFontSheet(u, use);
+      if (!kept.ok) { r.failed++; queue.push(imgQueueFailed(db, href, { permanent: kept.status === 415 || kept.status === 413, note: kept.msg })); return; }
+      const bytes = new TextEncoder().encode(kept.css);
+      if (bytes.byteLength > left.bytes || bytes.byteLength > mine.bytes) { r.over++; queue.push(imgQueueOver(db, href, bytes.byteLength)); return; }
+      left.images--; left.bytes -= bytes.byteLength; mine.images--; mine.bytes -= bytes.byteLength; r.bytes += bytes.byteLength;
+      await env.STORE.put(key, bytes, { httpMetadata: { contentType: "text/css" }, customMetadata: { at: now(), via: "arrival", fonts: String(kept.fonts.length) } });
+      r.stored++; queue.push(imgQueueDone(db, href), imgSeenRow(db, key)); fonts.push(...kept.fonts);
+    } catch (e) { r.failed++; queue.push(imgQueueFailed(db, href, { note: "error " + String(e?.message || e) })); }
+  }));
+  return fonts;
+}
 export async function prefetchImages(env, html, tag, o = {}) {
   await trkLoad(env).catch(() => {});
-  const hits = [], all = prefetchImageUrls(html, hits).slice(0, IMG_QUEUE_PER_MAIL), urls = all.slice(0, PREFETCH_MAX_IMAGES);
+  const hits = [], pics = prefetchImageUrls(html, hits).slice(0, IMG_QUEUE_PER_MAIL);
   // What a list or a learned pattern blocked is kept for the apps, so the mail they render hides the same pictures.
   if (hits.length) { try { await env.DB.batch(hits.slice(0, 200).map((x) => trkVerdictRow(env.DB, x))); } catch (_) {} }
-  if (!urls.length) return { n: 0, blocked: hits.length };
+  // The mail's fonts: those its own <style> declares now, and the stylesheets that name the rest, read first below.
+  const fp = fontPlan(html), ownFonts = [...new Set(fp.faces.filter((f) => fontWanted(f, fp.use)).map((f) => f.src))];
+  if (!pics.length && !ownFonts.length && !fp.sheets.length) return { n: 0, blocked: hits.length };
   const t0 = Date.now(), until = Math.min(t0 + PREFETCH_BUDGET_MS, o.deadline || Infinity);
   // Written ahead, in one batch: the pictures fetched now are marked as being fetched, so an open in the meantime waits for them; the
   // ones past the per-mail cap are left for the cron. If the batch fails the mail is prefetched as before, with nothing to fall back on.
@@ -930,23 +1109,38 @@ export async function prefetchImages(env, html, tag, o = {}) {
   const org = dom || "-";
   // Queued only (o.queueOnly: the mirror's picture fill, gmailPicFill): every row is due now and the cron's drain fetches it, under the
   // same allowance and shares; nothing is fetched here.
-  if (o.queueOnly) { try { await env.DB.batch(all.map((h) => imgQueueAhead(env.DB, h, null, org, 1))); } catch (_) { return { n: 0, queued: 0, blocked: hits.length }; } return { n: all.length, queued: all.length, blocked: hits.length }; }
-  try { await env.DB.batch(all.map((h, i) => imgQueueAhead(env.DB, h, i < urls.length ? busy : null, org))); } catch (_) {}
+  // (A stylesheet queued here is read by the cron with no mail at hand: its faces for English text, every family. FONT_USE_LATIN)
+  if (o.queueOnly) {
+    const rows = [...fp.sheets.map((h) => imgQueueAhead(env.DB, h, null, org, 1, "css")), ...ownFonts.slice(0, FONTS_PER_MAIL).map((h) => imgQueueAhead(env.DB, h, null, org, 1, "font")), ...pics.map((h) => imgQueueAhead(env.DB, h, null, org, 1))];
+    try { await env.DB.batch(rows); } catch (_) { return { n: 0, queued: 0, blocked: hits.length }; } return { n: rows.length, queued: rows.length, blocked: hits.length };
+  }
   const left = o.left || (await prefetchAllowance(env));
   const mine = await prefetchDomainLeft(env, org);   // this sender's share left today
-  if (left.images <= 0 || left.bytes <= 0 || mine.images <= 0 || mine.bytes <= 0) { try { await env.DB.batch(urls.map((h) => imgQueueLater(env.DB, h, "over", IMG_OVER_WAIT_MS))); } catch (_) {} await logEvent(env.DB, "img_prefetch_over_budget", null, `${tag} n=${urls.length}`); return { n: urls.length, stored: 0, over: true }; }
-  const r = { n: urls.length, stored: 0, had: 0, failed: 0, over: 0, bytes: 0, sized: 0 }; let next = 0; const queue = [];
+  if (left.images <= 0 || left.bytes <= 0 || mine.images <= 0 || mine.bytes <= 0) {
+    const later = [...fp.sheets.map((h) => [h, "css"]), ...ownFonts.slice(0, FONTS_PER_MAIL).map((h) => [h, "font"]), ...pics.slice(0, PREFETCH_MAX_IMAGES).map((h) => [h, null])];
+    try { await env.DB.batch([...[...fp.sheets.map((h) => [h, "css"]), ...ownFonts.slice(0, FONTS_PER_MAIL).map((h) => [h, "font"]), ...pics.map((h) => [h, null])].map(([h, w]) => imgQueueAhead(env.DB, h, null, org, 0, w)), ...later.map(([h]) => imgQueueLater(env.DB, h, "over", IMG_OVER_WAIT_MS))]); } catch (_) {}
+    await logEvent(env.DB, "img_prefetch_over_budget", null, `${tag} n=${later.length}`); return { n: later.length, stored: 0, over: true };
+  }
+  const r = { n: 0, stored: 0, had: 0, failed: 0, over: 0, bytes: 0, sized: 0, fonts: 0 }, queue = [], db = env.DB;
+  // The stylesheets first, all at once (at most SHEETS_PER_MAIL): what they keep says which fonts there are to fetch.
+  const sheetFonts = fp.sheets.length ? await prefetchFontSheets(env, fp.sheets, fp.use, { org, busy, left, mine, r, queue }) : [];
+  const fonts = [...new Set([...ownFonts, ...sheetFonts])].slice(0, FONTS_PER_MAIL), isFont = new Set(fonts);
+  const all = [...fonts, ...pics], urls = [...fonts, ...pics.slice(0, PREFETCH_MAX_IMAGES)];
+  r.n = urls.length + fp.sheets.length;
+  try { await env.DB.batch(all.map((h, i) => imgQueueAhead(env.DB, h, i < urls.length ? busy : null, org, 0, isFont.has(h) ? "font" : null))); } catch (_) {}
+  let next = 0;
   // Each picture's size is kept with it. One kept before sizes existed (a sender's logo in every newsletter) is measured
   // from the head of its stored copy the next time it comes by; `sized` stays null if the lookup fails, and then nothing is re-read.
   const dims = []; let sized = null;
-  try { const hks = urls.map(urlHash); sized = new Map(((await env.DB.prepare(`SELECT hk, w, h FROM img_dims WHERE hk IN (${hks.map(() => "?").join(", ")})`).bind(...hks).all()).results || []).map((x) => [x.hk, x])); } catch (_) {}
-  const db = env.DB, fail = (href, o2) => { r.failed++; queue.push(imgQueueFailed(db, href, o2)); };
+  try { const hks = urls.filter((h) => !isFont.has(h)).map(urlHash); sized = new Map(((await env.DB.prepare(`SELECT hk, w, h FROM img_dims WHERE hk IN (${hks.map(() => "?").join(", ")})`).bind(...hks).all()).results || []).map((x) => [x.hk, x])); } catch (_) {}
+  const fail = (href, o2) => { r.failed++; queue.push(imgQueueFailed(db, href, o2)); };
   // Every picture's measured size, by URL, with this mail as its sighting: what the learner reads.
   const obs = [], seenAs = (href, s) => { if (s && s.w > 0) obs.push(trkObsRow(db, href, s.w, s.h, dom, tag)); };
   const one = async (href) => {
-    const key = await imgKey(href);
+    const key = await imgKey(href), font = isFont.has(href);
     if (await imgHeld(env, key)) {
       r.had++; queue.push(imgQueueDone(db, href), imgTouchRow(db, key));
+      if (font) return;
       if (sized && !sized.has(urlHash(href))) { const o2 = await env.STORE.get(key, { range: { offset: 0, length: 65536 } }).catch(() => null); const head = o2 && (await o2.arrayBuffer().catch(() => null)); const row = head && imgDimsRow(env.DB, href, head); if (row) dims.push(row); if (head) seenAs(href, imgSize(new Uint8Array(head))); }
       else if (sized) seenAs(href, sized.get(urlHash(href)));
       return;
@@ -955,12 +1149,14 @@ export async function prefetchImages(env, html, tag, o = {}) {
     // What /api/img itself refuses (a named tracker, a bad or private host) is never fetched at an open either: no row is needed.
     let u; try { u = new URL(href); } catch (_) { r.failed++; queue.push(imgQueueDone(db, href)); return; }
     if (!/^https?:$/.test(u.protocol) || spyTrackerName(u.href) || badHost(u.hostname) || (await resolvesPrivate(u.hostname))) { r.failed++; queue.push(imgQueueDone(db, href)); return; }
-    const got = await fetchImageSafely(u, PREFETCH_IMG_MAX); if (!got.ok) return fail(href, { big: got.msg === "too large", permanent: got.status === 415, note: got.msg });
-    const buf = await new Response(got.body).arrayBuffer().catch(() => null); if (!buf) return fail(href, { big: true, note: "stream over the arrival cap or cut" });
+    // A font is a font by its bytes and at most FONT_MAX, given up for good otherwise (a page or a 30 MB CJK font will not change).
+    const got = await fetchImageSafely(u, font ? FONT_MAX : PREFETCH_IMG_MAX, { font }); if (!got.ok) return fail(href, { big: !font && got.msg === "too large", permanent: got.status === 415 || (font && got.status === 413), note: got.msg });
+    const buf = await new Response(got.body).arrayBuffer().catch(() => null); if (!buf) return fail(href, font ? { permanent: true, note: "font over 2 MB or cut" } : { big: true, note: "stream over the arrival cap or cut" });
     if (r.bytes + buf.byteLength > PREFETCH_MAX_BYTES) { r.failed++; queue.push(imgQueueLater(db, href, "new", 0)); return; }   // the mail's own byte cap: the cron keeps it
     if (left.images <= 0 || buf.byteLength > left.bytes || mine.images <= 0 || buf.byteLength > mine.bytes) { r.over++; queue.push(imgQueueOver(db, href, buf.byteLength)); return; }
     left.images--; left.bytes -= buf.byteLength; mine.images--; mine.bytes -= buf.byteLength; r.bytes += buf.byteLength;
     await env.STORE.put(key, buf, { httpMetadata: { contentType: got.ct }, customMetadata: { at: now(), via: "arrival" } }); r.stored++; queue.push(imgQueueDone(db, href));
+    if (font) { r.fonts++; queue.push(imgSeenRow(db, key)); return; }   // no size, no sighting, nothing to shrink
     const row = imgDimsRow(env.DB, href, buf); if (row) dims.push(row); seenAs(href, imgSize(new Uint8Array(buf)));
     queue.push(...imgKeptRows(env.DB, key, buf, got.ct, org));   // not in dims: r.sized counts measured pictures
   };
@@ -970,8 +1166,8 @@ export async function prefetchImages(env, html, tag, o = {}) {
   if (dims.length) { try { await env.DB.batch(dims); r.sized = dims.length; } catch (_) {} }
   if (obs.length) { try { await env.DB.batch(obs); } catch (_) {} }
   if (queue.length) { try { await env.DB.batch(queue); } catch (_) {} }   // lost: the rows stay as written ahead, and the cron takes them once the fetch window has passed
-  r.ms = Date.now() - t0; r.skipped = urls.length - r.stored - r.had - r.failed - r.over;
-  try { await logEvent(env.DB, "img_prefetch", null, `${tag} from=${org} n=${r.n} stored=${r.stored} had=${r.had} failed=${r.failed} over=${r.over} skipped=${r.skipped} sized=${r.sized} bytes=${r.bytes} ms=${r.ms}`); } catch (_) {}
+  r.ms = Date.now() - t0; r.skipped = Math.max(0, r.n - r.stored - r.had - r.failed - r.over);
+  try { await logEvent(env.DB, "img_prefetch", null, `${tag} from=${org} n=${r.n} stored=${r.stored} had=${r.had} failed=${r.failed} over=${r.over} skipped=${r.skipped} sized=${r.sized} fonts=${r.fonts} bytes=${r.bytes} ms=${r.ms}`); } catch (_) {}
   return r;
 }
 // The minute cron's turn at the picture queue: the rows that are due and not being fetched by an arrival, a dozen at most, two at a
@@ -985,15 +1181,19 @@ export async function prefetchImages(env, html, tag, o = {}) {
 const IMG_FILL_KEEP = { images: PREFETCH_DAY_IMAGES / 2, bytes: PREFETCH_DAY_BYTES / 2 }, IMG_FILL_KEEP_DOM = { images: PREFETCH_DOMAIN_IMAGES / 2, bytes: PREFETCH_DOMAIN_BYTES / 2 };
 export async function drainImgQueue(env, { max = 12, budgetMs = 15_000 } = {}) {
   const db = env.DB, t0 = Date.now(), at = now(); let rows;
-  try { rows = (await db.prepare("SELECT hk, url, dom, fill, size FROM img_queue WHERE state = 'pending' AND next_at <= ? AND (fetching_until IS NULL OR fetching_until < ?) ORDER BY fill, next_at LIMIT ?").bind(at, at, max).all()).results || []; } catch (_) { return { n: 0 }; }
+  try { rows = (await db.prepare("SELECT hk, url, dom, fill, size, what FROM img_queue WHERE state = 'pending' AND next_at <= ? AND (fetching_until IS NULL OR fetching_until < ?) ORDER BY fill, next_at LIMIT ?").bind(at, at, max).all()).results || []; } catch (_) { return { n: 0 }; }
   if (!rows.length) return { n: 0 };
   await trkLoad(env).catch(() => {});
   const left = await prefetchAllowance(env), r = { n: rows.length, stored: 0, had: 0, failed: 0, over: 0, dropped: 0, bytes: 0 }, writes = []; let next = 0;
   const shares = new Map(), kept = new Map();   // each organisation's share left today, read once a run; what was kept for it
   const shareOf = (org) => { if (!shares.has(org)) shares.set(org, prefetchDomainLeft(env, org)); return shares.get(org); };
-  const one = async ({ url: href, dom: org, fill, size }) => {
-    const key = await imgKey(href);
-    if (await imgHeld(env, key)) { r.had++; writes.push(imgQueueDone(db, href), imgTouchRow(db, key)); return; }
+  const kept0 = (org) => { if (!kept.has(org)) kept.set(org, { stored: 0, bytes: 0 }); return kept.get(org); };
+  // A stylesheet's fonts are queued once it is kept (or found kept), due now, under its sender and its fill.
+  const queueFonts = (css, org, fill) => { for (const f of fontSheetFonts(css).slice(0, FONTS_PER_MAIL)) writes.push(imgQueueAhead(db, f, null, org || null, fill, "font")); };
+  const one = async ({ url: href, dom: org, fill, size, what }) => {
+    const key = await imgKey(href), font = what === "font", sheet = what === "css";
+    if (sheet) { const held = await env.STORE.get(key).catch(() => null); if (held) { r.had++; writes.push(imgQueueDone(db, href), imgTouchRow(db, key)); if (held.httpMetadata?.contentType === "text/css") queueFonts(await held.text(), org, fill); return; } }
+    else if (await imgHeld(env, key)) { r.had++; writes.push(imgQueueDone(db, href), imgTouchRow(db, key)); return; }
     const mine = org ? await shareOf(org) : null;
     const kd = fill ? IMG_FILL_KEEP : { images: 0, bytes: 0 }, km = fill ? IMG_FILL_KEEP_DOM : { images: 0, bytes: 0 };   // what this picture must leave
     if (left.images <= kd.images || left.bytes <= kd.bytes || (mine && (mine.images <= km.images || mine.bytes <= km.bytes))) { r.over++; writes.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
@@ -1003,14 +1203,26 @@ export async function drainImgQueue(env, { max = 12, budgetMs = 15_000 } = {}) {
     // a list or a learned pattern may have come to block it since its mail arrived
     const v = u && trkVerdict(u.href, null); if (v) { r.dropped++; writes.push(imgQueueDone(db, href), trkVerdictRow(db, { href: u.href, ...v })); return; }
     if (!u || !/^https?:$/.test(u.protocol) || spyTrackerName(u.href) || badHost(u.hostname) || (await resolvesPrivate(u.hostname))) { r.dropped++; writes.push(imgQueueDone(db, href)); return; }
-    const got = await fetchImageSafely(u, IMG_MAX);
+    if (sheet) {
+      const kept = await fetchFontSheet(u, FONT_USE_LATIN);
+      if (!kept.ok) { r.failed++; writes.push(imgQueueFailed(db, href, { permanent: kept.status === 415 || kept.status === 413, note: kept.msg })); return; }
+      const bytes = new TextEncoder().encode(kept.css);
+      if (left.images <= kd.images || bytes.byteLength > left.bytes - kd.bytes || (mine && (mine.images <= km.images || bytes.byteLength > mine.bytes - km.bytes))) { r.over++; writes.push(imgQueueOver(db, href, bytes.byteLength)); return; }
+      left.images--; left.bytes -= bytes.byteLength; if (mine) { mine.images--; mine.bytes -= bytes.byteLength; }
+      await env.STORE.put(key, bytes, { httpMetadata: { contentType: "text/css" }, customMetadata: { at: now(), via: "queue", fonts: String(kept.fonts.length) } });
+      r.stored++; r.bytes += bytes.byteLength; writes.push(imgQueueDone(db, href), imgSeenRow(db, key)); queueFonts(kept.css, org, fill);
+      if (mine) { const k = kept0(org); k.stored++; k.bytes += bytes.byteLength; }
+      return;
+    }
+    const got = await fetchImageSafely(u, font ? FONT_MAX : IMG_MAX, { font });
     if (!got.ok) { r.failed++; writes.push(imgQueueFailed(db, href, { permanent: got.status === 415 || got.status === 413, note: got.msg })); return; }
     const buf = await new Response(got.body).arrayBuffer().catch(() => null);
-    if (!buf) { r.failed++; writes.push(imgQueueFailed(db, href, { note: "stream over the open cap or cut" })); return; }
+    if (!buf) { r.failed++; writes.push(imgQueueFailed(db, href, { permanent: font, note: font ? "font over 2 MB or cut" : "stream over the open cap or cut" })); return; }
     if (left.images <= kd.images || buf.byteLength > left.bytes - kd.bytes || (mine && (mine.images <= km.images || buf.byteLength > mine.bytes - km.bytes))) { r.over++; writes.push(imgQueueOver(db, href, buf.byteLength)); return; }
     left.images--; left.bytes -= buf.byteLength; if (mine) { mine.images--; mine.bytes -= buf.byteLength; }
     await env.STORE.put(key, buf, { httpMetadata: { contentType: got.ct }, customMetadata: { at: now(), via: "queue" } }); r.stored++; r.bytes += buf.byteLength; writes.push(imgQueueDone(db, href));
-    if (mine) { const k = kept.get(org) || { stored: 0, bytes: 0 }; k.stored++; k.bytes += buf.byteLength; kept.set(org, k); }   // counted once stored
+    if (mine) { const k = kept0(org); k.stored++; k.bytes += buf.byteLength; }   // counted once stored
+    if (font) { writes.push(imgSeenRow(db, key)); return; }   // no size, no sighting, nothing to shrink
     const d = imgDimsRow(db, href, buf); if (d) writes.push(d);
     const s = imgSize(new Uint8Array(buf)); if (s) writes.push(trkObsRow(db, href, s.w, s.h, null, null));   // a size, no new sighting
     writes.push(...imgKeptRows(db, key, buf, got.ct, org));
@@ -3134,21 +3346,41 @@ async function sendMail(env, body, opts = {}) {
 // One function for Send now and Send later: a scheduled forward was a plain send and went without the original's files. The note
 // is what the user typed above the forwarded block (the client sends only that: the block was sent twice, once from the compose box
 // and once from here). Bcc, the subject as edited and the Markdown note now reach the mail; all three were dropped.
+// The forward looks like the mail that arrived: the original's HTML as its body, under the note and a Gmail-style header,
+// its <style> blocks in the head, no quote bar; and its text part keeps each link's address. `as_typed`: the person edited the forwarded
+// block in the compose box, so their text goes as it is (the original's files still go with it).
+// The text a forward carries for a mail that has only HTML, one line per block, each link's address kept beside its words.
+function htmlTextLinked(html) {
+  const h = dropBlocks(dropComments(String(html || ""), " "), "head|style|script|title", " ")
+    .replace(/<a\b[^<>]*?[\s"']href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^<>]*>([\s\S]*?)<\/a\s*>/gi, (m0, a, b, c, inner) => { const href = htmlUnent(a ?? b ?? c ?? "").trim(), words = htmlUnent(inner.replace(/<[^<>]*>/g, " ")).replace(/\s+/g, " ").trim(); return /^(https?:|mailto:)/i.test(href) && !words.includes(href) ? `${inner} &lt;${href.replace(/^mailto:/i, "")}&gt;` : m0; })
+    .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6]|table|blockquote)\s*>/gi, "\n").replace(/<[^<>]+>/g, "");
+  return htmlUnent(h).split("\n").map((l) => l.replace(/[ \t\u00a0]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function forwardHtmlDoc(noteHtml, rows, html) {
+  const h = String(html || "").replace(/<script\b[\s\S]*?<\/script\s*>/gi, "");
+  const styles = [...h.matchAll(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi)].map((x) => x[0]).join("\n");
+  const bm = /<body\b([^>]*)>([\s\S]*?)(?:<\/body\s*>|$)/i.exec(h);
+  const inner = (bm ? bm[2] : h.replace(/<!doctype[^>]*>/i, "").replace(/<head\b[\s\S]*?<\/head\s*>/i, "").replace(/<\/?html\b[^>]*>/gi, "")).replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "");
+  const at = bm ? " " + bm[1] : "", bg = /[\s"']bgcolor\s*=\s*["']?([#\w]+)/i.exec(at)?.[1], st = /[\s"']style\s*=\s*"([^"]*)"/i.exec(at)?.[1] || "";
+  const look = `${bg ? `background-color:${bg};` : ""}${st}`.replace(/"/g, "'");
+  return `<!doctype html><html><head><meta charset="utf-8">${styles}</head><body>${noteHtml}<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">---------- Forwarded message ---------<br>${rows.map(([k, v]) => `${k}: ${esc(v)}`).join("<br>")}<br></div><br><br><div${look ? ` style="${look}"` : ""}>${inner}</div></div></body></html>`;
+}
 async function forwardMessage(env, id, body) {
   const db = env.DB;
   const p = await db.prepare("SELECT * FROM messages WHERE id = ?").bind(id).first();
   if (!p) throw Object.assign(new Error("message to forward not found"), { code: "not_found" });
   const from = lc(body.from || (p.direction === "in" ? p.identity : p.from_addr));
-  const esc = (v) => String(v || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const hdr = `---------- Forwarded message ----------\nFrom: ${p.from_name ? p.from_name + " <" + p.from_addr + ">" : p.from_addr}\nDate: ${p.date_hdr || p.created_at}\nSubject: ${p.subject || ""}\nTo: ${JSON.parse(p.to_addrs || "[]").map((a) => a.address).join(", ")}\n\n`;
+  const rows = [["From", p.from_name ? p.from_name + " <" + p.from_addr + ">" : p.from_addr], ["Date", p.date_hdr || p.created_at], ["Subject", p.subject || ""], ["To", JSON.parse(p.to_addrs || "[]").map((a) => a.address).join(", ")]];
+  const hdr = `---------- Forwarded message ----------\n${rows.map(([k, v]) => `${k}: ${v}`).join("\n")}\n\n`;
   const note = body.text ? body.text + "\n\n" : "";
-  const text = note + hdr + (p.body_text || htmlText(p.body_html));
   const noteHtml = body.html || (body.text ? `<div>${esc(body.text).replace(/\n/g, "<br>")}</div>` : "");
-  const html = p.body_html || body.html ? `${noteHtml}<br><div style="color:#666">${esc(hdr).replace(/\n/g, "<br>")}</div><blockquote style="border-left:2px solid #ccc;padding-left:10px;margin:0">${p.body_html || `<div style="white-space:pre-wrap">${esc(p.body_text)}</div>`}</blockquote>` : null;
+  const text = body.as_typed ? String(body.text || "") : note + hdr + (p.body_text || htmlTextLinked(p.body_html));
+  const html = body.as_typed ? (body.html || null) : p.body_html ? forwardHtmlDoc(noteHtml, rows, p.body_html) : body.html ? `${noteHtml}<br><div>${esc(hdr).replace(/\n/g, "<br>")}</div><div style="white-space:pre-wrap">${esc(p.body_text)}</div>` : null;
   const { results: atts } = await db.prepare("SELECT * FROM attachments WHERE message_id = ?").bind(p.id).all();
   const attachments = [];
   for (const a of atts) {
     if (!a.r2_key || a.r2_key.startsWith("out/")) continue;
+    if (body.as_typed && a.disposition === "inline") continue;   // an edited forward carries the original's files, not the pictures of its body
     const obj = await env.STORE.get(a.r2_key); if (!obj) continue;
     const buf = new Uint8Array(await obj.arrayBuffer());
     let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
@@ -3459,6 +3691,20 @@ async function api(request, env, url) {
     const lists = await trkRefreshLists(env, { force: !!b.force });
     return json({ lists, learned: await trkLearn(env) });
   }
+  // A mail's font stylesheet as the hub kept it when the mail arrived: its usable @font-face rules, each font's URL made
+  // the /api/img address the frame may load fonts from, carrying this request's key and the mail's arrival time, so a font is answered
+  // exactly as that mail's pictures are (never fetched from its sender at an open). Nothing is fetched here: a stylesheet the hub does
+  // not hold is answered empty, and the mail shows in its next font.
+  if (request.method === "GET" && path === "/api/fontcss") {
+    const css = (body, cc) => new Response(body, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": cc, "x-content-type-options": "nosniff" } });
+    let u; try { u = new URL(url.searchParams.get("u") || ""); } catch (_) { return css("/* bad url */", "no-store"); }
+    const key = await imgKey(u.href), obj = await env.STORE.get(key).catch(() => null);
+    if (!obj || obj.httpMetadata?.contentType !== "text/css") { try { obj?.body?.cancel(); } catch (_) {} return css("/* not kept */", "no-store"); }
+    imgSeen(env, key.slice(4));
+    const k = url.searchParams.get("k") || "", t = url.searchParams.get("t") || "";
+    const tail = (k ? "&k=" + encodeURIComponent(k) : "") + (/^\d{1,15}$/.test(t) ? "&t=" + t : "");
+    return css((await obj.text()).replace(/src:url\("([^"]+)"\)/g, (m0, f) => `src:url("/api/img?u=${encodeURIComponent(f)}${tail}")`), IMG_CC_SIZED);
+  }
   if (request.method === "GET" && path === "/api/img") {
     // A named spy tracker is never fetched, whoever asks: the client already disarms them (app.js blockSpyTrackers), and this is the
     // backstop for any path that did not: answered empty, with the vendor's name, the way Proton's proxy reports one.
@@ -3495,7 +3741,7 @@ async function api(request, env, url) {
       imgSeen(env, sha); return res;
     }
     const kept = await env.STORE.get(key).catch(() => null);
-    if (kept) { imgSeen(env, sha); console.log("img r2"); return imgResponse(kept.body, kept.httpMetadata?.contentType || "application/octet-stream", "r2"); }
+    if (kept) { const r2 = keptResponse(kept, "r2"); if (r2.status === 200) { imgSeen(env, sha); console.log("img r2"); if (r2.headers.get("cache-control") === IMG_CC_SIZED) { try { ctxWaitUntil(cache.put(ck, edgeCopy(r2.clone()))); } catch (_) {} } } return r2; }
     // The img Worker deletes an original only after writing its desktop size, so an original gone between the two reads above has a
     // size now: serve it rather than fall through to the queue or the sender.
     { const late = await env.STORE.get(`imgv/${sha}-1600`).catch(() => null);
@@ -3511,7 +3757,7 @@ async function api(request, env, url) {
       while (Date.now() < waitUntil) {
         await new Promise((res) => setTimeout(res, 400));
         const late = await env.STORE.get(key).catch(() => null);
-        if (late) { imgSeen(env, sha); console.log("img r2 after waiting for arrival"); return imgResponse(late.body, late.httpMetadata?.contentType || "application/octet-stream", "r2"); }   // an original: not edge-cached
+        if (late) { imgSeen(env, sha); console.log("img r2 after waiting for arrival"); return keptResponse(late, "r2"); }   // an original: not edge-cached
       }
       try { ctxWaitUntil(db.prepare("UPDATE img_queue SET opens = opens + 1 WHERE hk = ?").bind(hk).run().catch(() => {})); } catch (_) {}
       return new Response(null, { status: 404, headers: { "x-img-source": "withheld", "cache-control": "no-store" } });
@@ -3523,6 +3769,9 @@ async function api(request, env, url) {
     // from before the queue, and an app that sends no `t` are fetched at the open as before: re-download on revisit.
     { const t = +url.searchParams.get("t") || 0;
       if (t >= IMG_OPEN_SINCE && Date.now() - t < IMG_KEEP_MS) return new Response(null, { status: 404, headers: { "x-img-source": "not-kept", "cache-control": "no-store" } }); }
+    // A font is kept only when its mail arrives, and an open never asks a sender for one, old mail or new: the frame's
+    // font loads say so (Sec-Fetch-Dest), and a font file's own name does for an engine that sends no such header.
+    if (request.headers.get("sec-fetch-dest") === "font" || /\.(woff2?|ttf|otf|eot)$/i.test(u.pathname)) return new Response(null, { status: 404, headers: { "x-img-source": "font-not-kept", "cache-control": "no-store" } });
     // A list or a learned pattern is asked only here, before the sender would be: a picture already held, or queued, costs it nothing.
     { await trkLoad(env).catch(() => {}); const v = trkVerdict(u.href, null); if (v) return new Response(null, { status: 204, headers: { "x-tracker": v.name, "cache-control": "private, max-age=86400" } }); }
     // The DNS check (two DNS-over-HTTPS lookups) guards a fetch, so it runs only now: an image already held was checked when it was
@@ -5018,8 +5267,28 @@ class ImapClient {
     const m = g.match(/\[CAPABILITY ([^\]]+)\]/); if (m) m[1].split(" ").forEach((c) => this.caps.add(c.toUpperCase()));
     return g;
   }
-  async fill() { const { value, done } = await withTimeout(this.reader.read(), 30000, "imap read"); if (done) throw new Error("imap connection closed"); const n = new Uint8Array(this.buf.length + value.length); n.set(this.buf); n.set(value, this.buf.length); this.buf = n; }
-  async readLine() { for (;;) { for (let i = 0; i + 1 < this.buf.length; i++) if (this.buf[i] === 13 && this.buf[i + 1] === 10) { const line = decU.decode(this.buf.subarray(0, i)); this.buf = this.buf.subarray(i + 2); return line; } if (this.buf.length > 1_048_576) throw new Error("imap line longer than 1 MiB"); await this.fill(); } }   // a server that never ends a line cannot grow this without bound
+  // One read at a time, kept when a wait gives up on it (`pend`), so bytes that arrive after a timeout are never lost (IDLE waits minutes).
+  take(value) { const n = new Uint8Array(this.buf.length + value.length); n.set(this.buf); n.set(value, this.buf.length); this.buf = n; }
+  async fill() { this.pend ||= this.reader.read(); const { value, done } = await withTimeout(this.pend, 30000, "imap read"); this.pend = null; if (done) throw new Error("imap connection closed"); this.take(value); }
+  async fillWait(ms) { if (ms <= 0) return false; this.pend ||= this.reader.read(); let t; const got = await Promise.race([this.pend, new Promise((r) => { t = setTimeout(() => r(null), ms); })]); clearTimeout(t); if (got === null) return false; this.pend = null; if (got.done) throw new Error("imap connection closed"); this.take(got.value); return true; }
+  lineReady() { for (let i = 0; i + 1 < this.buf.length; i++) if (this.buf[i] === 13 && this.buf[i + 1] === 10) { const line = decU.decode(this.buf.subarray(0, i)); this.buf = this.buf.subarray(i + 2); return line; } if (this.buf.length > 1_048_576) throw new Error("imap line longer than 1 MiB"); return null; }
+  async readLine() { for (;;) { const l = this.lineReady(); if (l !== null) return l; await this.fill(); } }   // a server that never ends a line cannot grow this without bound
+  async waitLine(until) { for (;;) { const l = this.lineReady(); if (l !== null) return l; if (!(await this.fillWait(until - Date.now()))) return null; } }
+  // IDLE (RFC 2177): the server says when the selected mailbox changes. Waits up to `ms`, ends with DONE, and answers
+  // what woke it: "new" (EXISTS), "changed" (EXPUNGE or FETCH, a flag or a deletion made elsewhere) or null (the time ran out).
+  async idle(ms) {
+    const tag = "A" + String(++this.tagN).padStart(4, "0"), until = Date.now() + ms; let wake = null;
+    await this.write(`${tag} IDLE\r\n`);
+    const saw = (l) => { if (/^\* \d+ EXISTS\b/i.test(l)) wake = "new"; else if (/^\* (\d+ (EXPUNGE|FETCH)|VANISHED)\b/i.test(l)) wake ||= "changed"; else if (/^\* BYE\b/i.test(l)) throw new Error("imap connection closed: " + l.slice(0, 80)); };
+    for (;;) {
+      const l = await this.waitLine(until); if (l === null) break;
+      if (l.startsWith(tag + " ")) throw new Error("imap IDLE → " + l.slice(tag.length + 1, tag.length + 120));   // refused: no IDLE here
+      if (l.startsWith("+")) continue;
+      saw(l); if (wake) break;
+    }
+    await this.write("DONE\r\n");
+    for (;;) { const r = await this.readResponse(); if (r.line.startsWith(tag + " ")) { if (!/^OK/i.test(r.line.slice(tag.length + 1))) throw new Error("imap IDLE → " + r.line.slice(tag.length + 1, tag.length + 120)); return wake; } saw(r.line); }
+  }   // a server that never ends a line cannot grow this without bound
   async readBytes(n) { if (n > IMAP_LITERAL_MAX) throw new Error(`the server announced a ${Math.round(n / 1048576)} MB literal, over the ${IMAP_LITERAL_MAX / 1048576} MB this Worker will hold`); while (this.buf.length < n) await this.fill(); const out = this.buf.slice(0, n); this.buf = this.buf.subarray(n); return out; }
   async readResponse() { let line = await this.readLine(); const literals = []; let m; while ((m = line.match(/\{(\d+)\}$/))) { literals.push(await this.readBytes(Number(m[1]))); line = line.slice(0, -m[0].length) + `\u0000LIT${literals.length - 1}\u0000` + (await this.readLine()); } return { line, literals }; }
   write(s) { return this.writer.write(encU.encode(s)); }
@@ -5248,16 +5517,17 @@ async function imapSyncAccount(env, acct, opts = {}) {
   try { return await imapSyncAccountLeased(env, acct, opts, token); }
   finally { try { await db.prepare("UPDATE imap_folders SET sync_until = NULL, sync_token = NULL WHERE account = ? AND folder = 'INBOX' AND sync_token = ?").bind(acct.email, token).run(); } catch (_) {} }
 }
-async function imapSyncAccountLeased(env, acct, { backfill = 0, sweep = false, initialWindow = 100 } = {}, token) {
+// `client`: a connection already open and signed in (the IDLE watcher's), used as it is and left open.
+async function imapSyncAccountLeased(env, acct, { backfill = 0, sweep = false, initialWindow = 100, client = null } = {}, token) {
   const db = env.DB;
-  acct = { ...acct, password: await imapPassword(env, acct) };   // unlocked BEFORE any connection: a row that fails to unlock never reaches a server
-  const started = Date.now(); const c = new ImapClient(acct.host, acct.port);
+  if (!client) acct = { ...acct, password: await imapPassword(env, acct) };   // unlocked BEFORE any connection: a row that fails to unlock never reaches a server
+  const started = Date.now(); const c = client || new ImapClient(acct.host, acct.port);
   // A connection that cannot be made left no trace at all (no event, no last_error), so "unreachable" looked like silence. It is
   // recorded where Settings reads it, without an event a minute.
-  try { await c.connect(); } catch (e) { try { await db.prepare("INSERT INTO imap_folders (account, folder, role, last_error) VALUES (?, 'INBOX', 'inbox', ?) ON CONFLICT(account, folder) DO UPDATE SET last_error = excluded.last_error").bind(acct.email, `cannot connect: ${String(e?.message || e).slice(0, 280)}`).run(); } catch (_) {} throw e; }
+  if (!client) try { await c.connect(); } catch (e) { try { await db.prepare("INSERT INTO imap_folders (account, folder, role, last_error) VALUES (?, 'INBOX', 'inbox', ?) ON CONFLICT(account, folder) DO UPDATE SET last_error = excluded.last_error").bind(acct.email, `cannot connect: ${String(e?.message || e).slice(0, 280)}`).run(); } catch (_) {} throw e; }
   const out = { account: acct.email, folder: "INBOX", fetched: 0, dup: 0, backfilled: 0, flagsChanged: 0, removed: 0, items: [] };
   try {
-    await imapLogin(db, c, acct);
+    if (!client) await imapLogin(db, c, acct);
     const roles = await imapFolderRoles(db, c, acct);
     const folder = "INBOX";
     const st = await db.prepare("SELECT * FROM imap_folders WHERE account = ? AND folder = ?").bind(acct.email, folder).first();
@@ -5323,7 +5593,7 @@ async function imapSyncAccountLeased(env, acct, { backfill = 0, sweep = false, i
     await db.prepare("INSERT INTO imap_folders (account, folder, role, last_error) VALUES (?, 'INBOX', 'inbox', ?) ON CONFLICT(account, folder) DO UPDATE SET last_error = excluded.last_error").bind(acct.email, String(e?.message || e).slice(0, 300)).run();
     await logEvent(db, "imap_sync_fail", null, `${acct.email} ${e?.message}`);
     throw e;
-  } finally { await c.logout(); }
+  } finally { if (!client) await c.logout(); }
 }
 // The work mailbox's Sent folder. Only the Inbox was ever read, so mail the user sent from the work address in
 // Outlook, on his phone or in the webmail never reached the hub, and Sent under the work account was empty (0 sent messages stored
@@ -5370,6 +5640,60 @@ async function imapSyncSent(env, c, acct, folder, token) {
   return r;
 }
 async function imapSyncAll(env, opts = {}) { const out = []; for (const a of await imapAccounts(env, { fresh: true })) { try { out.push(await imapSyncAccount(env, a, opts)); } catch (e) { out.push({ account: a.email, error: e?.message }); } } return out; }
+// ---------- instant work mail: IMAP IDLE inside the minute cron's own run ----------
+// The hub signed in to the work mailbox every minute, read it and hung up: 1,440 sign-ins a day, new mail waiting up to a minute, and
+// the server refusing one sign-in in about 8,000 (5 in the 30 days to 2026-11-26, each alone, the next minute fine). A desktop client keeps
+// one connection and lets the server say when mail lands (IMAP IDLE, RFC 2177). A Worker cannot hold a connection between invocations,
+// but one invocation can hold it for a long time: a Cron Trigger run may last 15 minutes of wall time, and Workers bill requests and CPU
+// time, never duration ("No charge or limit for duration", Workers pricing), while a connection waiting in IDLE spends no CPU. So each
+// minute's run offers to watch the mailbox; the run that takes its lease signs in once, catches up, and IDLEs until 13 min 50 s after
+// its scheduled time, fetching on that same connection the moment the server says mail arrived (EXISTS) or changed (EXPUNGE, FETCH),
+// then gives the lease up for the next minute's run to take. While a watcher holds the lease, nothing else signs in to read the Inbox
+// (imapSyncAccount: "another sync of this mailbox is running"). A server without IDLE gets one read a minute, as before; a watcher that
+// fails ends, and the next minute's run starts another. About 100 sign-ins a day, new mail in seconds, at no cost.
+export const IMAP_WATCH = { endMs: 13 * 60_000 + 50_000, sliceMs: 4 * 60_000, marginMs: 10_000, maxWakes: 20 };   // marginMs: the last wait ends this long before the run's end
+async function imapWatch(env, acct, startedAt = Date.now()) {
+  const db = env.DB, end = startedAt + IMAP_WATCH.endMs, out = { account: acct.email, wakes: 0, syncs: 0, idle: false };
+  if (!acct.ready) return { ...out, skipped: `secret ${acct.secret} not set` };
+  if (await imapSigninWaiting(db, acct.email)) return { ...out, skipped: "sign-in refused; waiting" };
+  const token = uuid();
+  await db.prepare("INSERT INTO imap_folders (account, folder, role) VALUES (?, 'INBOX', 'inbox') ON CONFLICT(account, folder) DO NOTHING").bind(acct.email).run();
+  const got = await db.prepare("UPDATE imap_folders SET sync_until = ?, sync_token = ? WHERE account = ? AND folder = 'INBOX' AND (sync_until IS NULL OR sync_until < ?)").bind(Date.now() + IMAP_LEASE_MS, token, acct.email, Date.now()).run();
+  if (!got.meta?.changes) return { ...out, skipped: "watched or syncing" };
+  // The lease is held for the slice about to be waited, never past this run's own end (a run cut off is taken over a minute later).
+  const hold = async (ms) => ((await db.prepare("UPDATE imap_folders SET sync_until = ? WHERE account = ? AND folder = 'INBOX' AND sync_token = ?").bind(Math.min(Date.now() + ms, end + 5_000), acct.email, token).run()).meta?.changes || 0) > 0;
+  let c = null;
+  try {
+    const a = { ...acct, password: await imapPassword(env, acct) };
+    c = new ImapClient(a.host, a.port);
+    try { await c.connect(); } catch (e) { try { await db.prepare("UPDATE imap_folders SET last_error = ? WHERE account = ? AND folder = 'INBOX'").bind(`cannot connect: ${String(e?.message || e).slice(0, 280)}`, acct.email).run(); } catch (_) {} throw e; }
+    await imapLogin(db, c, a);
+    await imapSyncAccountLeased(env, a, { client: c }, token); out.syncs++;   // what came while no one watched
+    if (!c.caps.has("IDLE")) return out;
+    out.idle = true;
+    while (Date.now() < end - IMAP_WATCH.marginMs * 1.5 && out.wakes < IMAP_WATCH.maxWakes) {
+      const slice = Math.min(IMAP_WATCH.sliceMs, end - IMAP_WATCH.marginMs - Date.now());
+      if (!(await hold(slice + 60_000))) break;   // the lease went to another run
+      await c.select("INBOX");
+      const wake = await c.idle(slice);
+      if (!wake) continue;
+      out.wakes++;
+      await imapSyncAccountLeased(env, a, { client: c, sweep: wake === "changed" }, token); out.syncs++;
+    }
+    return out;
+  } catch (e) { out.error = String(e?.message || e).slice(0, 200); return out; }   // the next minute's run starts again
+  finally {
+    if (c) await c.logout();
+    try { await db.prepare("UPDATE imap_folders SET sync_until = NULL, sync_token = NULL WHERE account = ? AND folder = 'INBOX' AND sync_token = ?").bind(acct.email, token).run(); } catch (_) {}
+    if (out.wakes || out.error) { try { await logEvent(db, "imap_watch", null, `${acct.email} wakes=${out.wakes} syncs=${out.syncs}${out.error ? " error=" + out.error : ""}`); } catch (_) {} }
+  }
+}
+// Each minute: a watcher for every work mailbox, running in this run's background (it outlives the minute; the next run's offer finds
+// the lease held and stands down). `startedAt` is the run's scheduled time, which its 15 minutes count from.
+export async function imapWatchAll(env, startedAt = Date.now()) {
+  const list = await imapAccounts(env, { fresh: true });
+  return Promise.all(list.map((a) => imapWatch(env, a, startedAt).catch((e) => ({ account: a.email, error: String(e?.message || e) }))));
+}
 // Write-back queue: hub actions on IMAP-backed threads become server operations (flags, moves), executed at once and retried by the cron.
 async function imapQueueForThread(env, threadId, patch) {
   const db = env.DB;
@@ -7008,7 +7332,9 @@ export default {
     // Every minute: Gmail new-mail detection (push + Gatekeeper) and the scheduler (snooze / send later / reminders).
     try { await gmailPoll(env); } catch (e) { await logEvent(env.DB, "gmail_poll_fail", null, e?.message); }
     try { await runScheduled(env); } catch (e) { await logEvent(env.DB, "scheduler_fail", null, e?.message); }
-    try { await imapSyncAll(env); } catch (e) { await logEvent(env.DB, "imap_sync_fail", null, e?.message); }
+    // The work mailbox, watched: this run's watcher catches up and then waits on the server for up to 14 minutes, in the
+    // background, so the rest of this minute's work does not wait for it.
+    try { ctxWaitUntil(imapWatchAll(env, event.scheduledTime || Date.now()).catch(async (e) => { await logEvent(env.DB, "imap_sync_fail", null, e?.message); })); } catch (e) { await logEvent(env.DB, "imap_sync_fail", null, e?.message); }
     try { await runImapOps(env); } catch (e) { await logEvent(env.DB, "imap_ops_fail", null, e?.message); }
     // Mail accepted but not yet indexed. First in the daily block below would be too late: the inbox would be missing it
     // until 09:00 UTC, so this drains every minute.
@@ -7219,7 +7545,9 @@ export default {
       // Sec-Fetch-Dest itself and no page can change it; attachment downloads are navigations, so they never need the key. Without
       // this a mail could make the hub call the Gmail API with the user's token for invented attachment ids, hundreds per open.
       // No key computable means no image: comparing against a placeholder ("\0") would let a request that sent that placeholder through.
-      if (!viaToken && (url.pathname === "/api/img" || request.headers.get("sec-fetch-dest") === "image")) {
+      // A font or a stylesheet load is held to the same key: the frame may load fonts from /api/img and stylesheets from
+      // /api/fontcss alone, and a mail's own @font-face or @import naming another hub address must not reach it with the session.
+      if (!viaToken && (url.pathname === "/api/img" || url.pathname === "/api/fontcss" || ["image", "font", "style"].includes(request.headers.get("sec-fetch-dest") || ""))) {
         const want = await imgSessionKey(request, env);
         if (!want || !(await constantTimeEqual(url.searchParams.get("k") || "", want))) return new Response("image key required", { status: 403 });
       }
