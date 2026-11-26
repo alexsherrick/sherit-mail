@@ -27,7 +27,7 @@ SPY = """(acct) => { const sent = window.__mSent = []; const f = window.fetch;
     { id: 'aaaaaaaa-0000-0000-0000-00000000000a', pattern: '*@uber.com', scope: acct, words, kept: 2, dropped: 31, created_at: '2026-10-16T22:00:02Z' },
     { id: 'aaaaaaaa-0000-0000-0000-00000000000b', pattern: '*@bandsintown.com', scope: acct, words, kept: 0, dropped: 5, created_at: '2026-10-16T22:00:01Z' }], recent: [] };
   window.__mock.routes['DELETE /api/mention-rules/aaaaaaaa-0000-0000-0000-00000000000b'] = { ok: true, removed: 1 };
-  window.__mock.routes['POST /api/mention-rules'] = { ok: true, rule: { id: 'aaaaaaaa-0000-0000-0000-00000000000b', pattern: '*@bandsintown.com', scope: acct, words: ['SXSW', 'City Fest'], kept: 0, dropped: 5 } }; }"""
+  window.__mock.routes['POST /api/mention-rules'] = { ok: true, rule: { id: 'aaaaaaaa-0000-0000-0000-00000000000b', pattern: '*@bandsintown.com', scope: acct, words: ['SXSW', 'City Fest'], kept: 0, dropped: 5 } }; window.mh.state.mention = null; /* the app loads Settings' data at boot; these are the hub's rules from here on */ }"""
 # Two of the fake Gmail account's conversations, re-dressed: a Bandsintown mail from a subdomain, and the pptx mail from a gmail.com address.
 ROWS = """() => { const g = (id) => window.mh.state.threads.get('sam.owner.sxsw@gmail.com|' + id);
   const set = (t, from, subject) => Object.assign(t, { from, fromAddr: from.replace(/^.*<|>$/g, ''), fromName: from.replace(/\\s*<.*$/, ''), subject, state: 'inbox' });

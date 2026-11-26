@@ -1733,6 +1733,11 @@ async function act(t, action, { quiet = false } = {}) {
     // four-fold is not congestion; it is a fixed offset, and the offset is the human plus the animation. So act:<action> is now
     // timed from the COMMIT (the moment the app is actually asked to do the work) which is the only part this code controls.
     const tap = perf.lastInput;
+    // "Not spam" on a sender the hub took for an impostor accepts it: its domain then counts as one that has written,
+    // so its next mail is not filed in Spam again, and the banner goes.
+    if (action === "notspam" && t.fromAddr && state.impostorKnown && impostorOf(unbidi(t.fromName || ""), unbidi(t.fromAddr), state.impostorKnown)) {
+      api("/api/senders", { method: "POST", body: JSON.stringify({ address: lc(unbidi(t.fromAddr)), status: "accepted" }) }).then(() => { state.impostorKnown.orgs.add(impostorRoot(lc(unbidi(t.fromAddr)).split("@")[1] || "")); }).catch(() => {});
+    }
     const snoozed = ["done", "trash", "restore", "spam"].includes(action) ? cancelSnooze(t) : null;
     const out = perf.measure("act:" + action, () => localAct(t, action, { quiet, snoozed }), performance.now());
     // …and the end-to-end number is kept, honestly labelled, because it IS what the user experiences: it is just not a
@@ -2137,13 +2142,19 @@ const unsubNeedCount = () => (state.unsubs || []).filter(unsubNeeds).length;
 async function loadUnsubs() {
   loadUnsubs.at = Date.now();
   try { state.unsubs = (await api("/api/unsubscribes")).unsubscribes || []; } catch (_) { state.unsubs ||= []; }
+  return unsubBadge();
+}
+// The Settings button's count of unsubscribes that need the user; from loadUnsubs() or from Settings' one request.
+function unsubBadge() {
+  state.unsubs ||= [];
   const n = unsubNeedCount(), b = $("#settingsBtn"); if (!b) return state.unsubs;
   let d = b.querySelector(".nbadge"); if (!n) { d?.remove(); b.title = "Settings"; return state.unsubs; }
   if (!d) { d = document.createElement("span"); d.className = "nbadge"; b.appendChild(d); }
   d.textContent = String(n); b.title = `Settings · ${n === 1 ? "an unsubscribe needs" : n + " unsubscribes need"} you`;
   return state.unsubs;
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - (loadUnsubs.at || 0) > 10 * 60_000) scheduleIdle(loadUnsubs); });
+// Back after ten minutes: Settings' one request, which carries the unsubscribes and the badge with them.
+document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - (loadUnsubs.at || 0) > 10 * 60_000) scheduleIdle(() => settingsFetch()); });
 function unsubSection() {
   const rows = state.unsubs || [], need = rows.filter(unsubNeeds), rest = rows.filter((u) => !unsubNeeds(u)).slice(0, 60);
   const ago = (iso) => when(Date.parse(iso || "") || 0);
@@ -2853,8 +2864,15 @@ function tagSafe(h) {
   return s;
 }
 const tagSafeMsg = (m) => m && m.html && !m.text ? { ...m, html: tagSafe(m.html) } : m;
+// The domains that have written to the user, for the impostor banner: asked of the hub once a session, at boot,
+// and after a failure again on a draw a minute later at the soonest. A message drawn before it is in just has no banner.
+let impostorAsk = null;
+function impostorKnownNow() {
+  if (!state.impostorKnown && !impostorAsk) impostorAsk = api("/api/senders/orgs").then((r) => { state.impostorKnown = impostorKnownOf(r.orgs || []); }).catch(() => { setTimeout(() => { impostorAsk = null; }, 60e3); });
+  return state.impostorKnown || null;
+}
 function trustBar(m) {
-  let v = null; try { v = assessTrust(m ? { ...m, fromAddr: unbidi(m.fromAddr), ...(m.html ? { html: tagSafe(m.html) } : {}) } : m); } catch (_) { v = null; } if (!v) return "";
+  let v = null; try { v = assessTrust(m ? { ...m, fromAddr: unbidi(m.fromAddr), fromName: unbidi(nameOf(m.from)), known: impostorKnownNow(), ...(m.html ? { html: tagSafe(m.html) } : {}) } : m); } catch (_) { v = null; } if (!v) return "";
   return `<div class="trustbar ${v.level}" role="alert"${v.ageDomain ? ` data-age="${esc(v.ageDomain)}" data-at="${Number(v.date) || 0}"` : ""}><b>${v.level === "danger" ? "⚠ Probably fake" : "⚠ Not verified"} — ${esc(v.title)}</b><ul>${v.lines.map((l) => `<li>${esc(l)}</li>`).join("")}<li class="age" hidden></li></ul></div>`;
 }
 // An address lock kept this message out. Say whose address it is, and offer to let the sender's company in. A sender
@@ -4903,29 +4921,83 @@ function openImapForm(pre = {}) {
   slot.scrollIntoView({ block: "nearest" });
 }
 const closeSettings = () => { clearImapForm(); dropLayer("settings-sec"); if (!dropLayer("settings")) $("#smodal").classList.remove("on"); };
-async function openSettings(want) {
+// ---------- Settings' data ----------
+// The screen awaited seven requests one after another before it drew anything: 1.0 s from my Mac on 2026-11-25, more on a
+// phone, and again on every redraw. Now it draws at once from what this device last had (in memory, and in IndexedDB across launches,
+// wiped with everything else at sign-out), and one GET /api/settings brings all seven parts; when it lands with anything different,
+// the open screen is drawn again, keeping its scroll, what is typed in it and its focus. A redraw after an action (the screen already
+// open) waits for that one request instead, so it shows what the hub now has, as it always did.
+const SETTINGS_PARTS = { push: (d) => { state.pushSubs = d; }, quiet: (d) => { state.quiet = d.rules || []; }, trash: (d) => { state.trashRules = d.rules || []; },
+  locks: (d) => { state.locks = d.locks || []; }, mention: (d) => { state.mention = d; }, trackers: (d) => { state.trk = d; }, unsubs: (d) => { state.unsubs = d.unsubscribes || []; } };
+let settingsHave = null, settingsSeq = 0, settingsShown = 0, settingsAsk = null;   // the last answer, by part; requests asked and applied
+function settingsApply(d) {
+  const was = JSON.stringify(settingsHave || {}), have = { ...(settingsHave || {}) };
+  for (const [k, set] of Object.entries(SETTINGS_PARTS)) { const v = d && d[k]; if (v && typeof v === "object" && !v.__error) { have[k] = v; set(v); } }
+  settingsHave = have; return JSON.stringify(have) !== was;
+}
+// From this device's last answer, once a session (at boot, in the background): the first open has something to draw.
+async function settingsKept() { if (settingsHave) return; try { const d = await idb.meta("settings"); if (d && !settingsHave) settingsApply(d); } catch (_) {} }
+// One request for all of it. `again`: a new one even while one is out (after an action, the one out may predate it). An older answer
+// never replaces a newer one. Resolves true when the parts changed.
+function settingsFetch(again = false) {
+  if (settingsAsk && !again) return settingsAsk;
+  const seq = ++settingsSeq;
+  const ask = api("/api/settings").then((d) => {
+    if (seq < settingsShown) return false; settingsShown = seq;
+    const changed = settingsApply(d); if (changed) idb.meta("settings", settingsHave).catch(() => {});
+    loadUnsubs.at = Date.now(); unsubBadge(); return changed;
+  }).catch(() => false).finally(() => { if (settingsAsk === ask) settingsAsk = null; });
+  return (settingsAsk = ask);
+}
+// The open screen drawn again from state, as it stands: its scroll, what is typed in it and the focused field kept.
+function settingsRedraw() {
+  if (!$("#smodal").classList.contains("on")) return;
+  const card = $("#scard"), scroll = [...card.querySelectorAll(".st-body, .st-main, .st-nav")].map((el) => el.scrollTop), typed = {};
+  for (const el of card.querySelectorAll("input[id], textarea[id]")) if (!/^(checkbox|radio|button|submit|file|color|range)$/i.test(el.type || "") && el.value) typed[el.id] = el.value;
+  const f = document.activeElement, fid = f && card.contains(f) && f.id ? f.id : null, sel = fid && typeof f.selectionStart === "number" ? [f.selectionStart, f.selectionEnd] : null;
+  return openSettings(undefined, { redraw: true }).then(() => {
+    [...card.querySelectorAll(".st-body, .st-main, .st-nav")].forEach((el, i) => { if (scroll[i]) el.scrollTop = scroll[i]; });
+    for (const [id, v] of Object.entries(typed)) { const el = document.getElementById(id); if (el && card.contains(el) && !el.value) el.value = v; }
+    const g = fid && document.getElementById(fid); if (g && card.contains(g)) { g.focus({ preventScroll: true }); if (sel) try { g.setSelectionRange(sel[0], sel[1]); } catch (_) {} }
+  });
+}
+// A browser's own push state (no native app has Web Push): looked up beside the screen, never before it; a lookup that never settles
+// gives up at 3 s, as before, and the screen is drawn again only when what it found is new.
+// `redraw` false: the caller awaits the lookup and draws itself.
+const settingsPush = { sub: undefined, look: null };
+function settingsPushLook(redraw = true) {
+  if (NATIVE_MAC || NATIVE_ANDROID || NATIVE_WINDOWS) return Promise.resolve(null);
+  return (settingsPush.look ??= (async () => {
+    const reg = await Promise.race([navigator.serviceWorker?.getRegistration?.(), sleep(3000)]).catch(() => null);
+    const sub = reg?.pushManager ? await Promise.race([reg.pushManager.getSubscription(), sleep(3000)]).catch(() => null) : null;
+    const was = settingsPush.sub; settingsPush.sub = sub || null;
+    if (redraw && (was ?? null) !== settingsPush.sub) settingsRedraw();
+    return settingsPush.sub;
+  })().finally(() => { settingsPush.look = null; }));
+}
+async function openSettings(want, o = {}) {
+  const t0 = performance.now();
   const already = $("#smodal").classList.contains("on");
   $("#smodal").classList.add("on"); closeMenu();
   // openSettings() also re-renders an open screen (after a rule is added, an account disconnected…): its layer is already there, and a
   // phone that is inside a section has that section's layer on top, which a second "settings" push would bury.
   if (!already) pushLayer("settings", () => { clearImapForm(); $("#smodal").classList.remove("on"); settingsUI.inSec = false; $("#scard").classList.remove("insec"); });
   const p = prefs(); const push = state.push;
-  // Re-registering is worth one network round trip when you OPEN this screen to find out why push is quiet. It is not worth one
-  // on every re-render: openSettings() is re-invoked after adding a rule, deleting a rule and disconnecting an account, and each
-  // of those was blocking the repaint on a POST (and on a device where no worker ever activates, on the full 3 s ready race).
-  if (!openSettings.synced) { openSettings.synced = true; await syncPushSubscription(); }
-  const subs = await api("/api/push/subscriptions").catch(() => ({ subscriptions: [] }));
-  state.quiet = (await api("/api/quiet-rules").catch(() => ({ rules: state.quiet || [] }))).rules || [];
-  state.trashRules = (await api("/api/trash-rules").catch(() => ({ rules: state.trashRules || [] }))).rules || [];
-  state.locks = (await api("/api/locks").catch(() => ({ locks: state.locks || [] }))).locks || [];
-  state.mention = await api("/api/mention-rules").catch(() => state.mention || { rules: [], recent: [] });
-  state.trk = await api("/api/trackers/status").catch(() => state.trk || null);
-  await loadUnsubs();
+  // Re-registering is worth a round trip once a session, when the screen is first opened to see why push is quiet; it now runs beside
+  // the screen, and the push state is looked up again when it is done.
+  if (!openSettings.synced) { openSettings.synced = true; syncPushSubscription().finally(() => { settingsPush.sub = undefined; settingsPushLook(); }); }
+  if (!o.redraw) {
+    if (!settingsHave) await settingsKept();
+    const fresh = settingsFetch(already);
+    if (already || !settingsHave) await fresh;   // after an action, or with nothing at all to draw yet: the one request
+    else fresh.then((changed) => { if (changed) settingsRedraw(); perf.record("settings:fresh", performance.now() - t0); });
+  }
+  const subs = state.pushSubs || { subscriptions: [] };
   // The native apps have no Web Push at all (Android's WebView has no PushManager: reg.pushManager.getSubscription() threw here and
-  // left Settings an empty card), and a browser's lookup may never settle, so neither may hold up this screen.
+  // left Settings an empty card), and a browser's lookup may never settle, so neither holds up this screen.
   const NATIVE = NATIVE_MAC || NATIVE_ANDROID || NATIVE_WINDOWS;
-  const reg = NATIVE ? null : await Promise.race([navigator.serviceWorker?.getRegistration?.(), sleep(3000)]).catch(() => null);
-  const sub = reg?.pushManager ? await Promise.race([reg.pushManager.getSubscription(), sleep(3000)]).catch(() => null) : null;
+  if (!NATIVE && settingsPush.sub === undefined) { const look = settingsPushLook(!already && !o.redraw); if (already && !o.redraw) await look; }
+  const sub = settingsPush.sub || null;
   const mineId = myPushId(); const mine = subs.subscriptions.find((x) => x.id === mineId) || null;
   const opt = (v, cur) => Object.entries(ACTIONS).map(([k, l]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${l}</option>`).join("");
   const sel = (id, pairs, cur, attrs = "") => `<select class="f" ${id ? `id="${id}"` : ""} ${attrs}>${pairs.map(([k, l]) => `<option value="${esc(k)}" ${k === cur ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
@@ -5145,8 +5217,9 @@ async function openSettings(want) {
     try { const r = await api("/api/locks", { method: "POST", body: JSON.stringify({ address: `${local}@${dom}` }) }); toast(`${r.address} is locked. The first company to write to it claims it.`, 6000); openSettings(); } catch (e) { toast(e.message, 6000); }
   };
   $("#radd").onclick = async () => { try { const r = await api("/api/sender-rules", { method: "POST", body: JSON.stringify({ pattern: $("#rpat").value, action: $("#ract").value, scope: $("#rscope").value }) }); state.rules.push(r.rule); openSettings(); } catch (e) { toast(e.message); } };
-  if ($("#penable")) $("#penable").onclick = () => togglePush(sub).then(openSettings).catch((e) => toast(e.message));
+  if ($("#penable")) $("#penable").onclick = () => togglePush(sub).then(() => { settingsPush.sub = undefined; return openSettings(); }).catch((e) => toast(e.message));
   if ($("#ptest")) $("#ptest").onclick = () => api("/api/push/test", { method: "POST" }).then((r) => toast(`Sent to ${r.sent} device(s)${r.failed ? ", " + r.failed + " failed" : ""}`)).catch((e) => toast(e.message));
+  if (!already && !o.redraw) perf.record("settings:paint", performance.now() - t0);   // tap to a drawn screen
 }
 $("#settingsBtn").onclick = () => openSettings(); $("#accountsBtn").onclick = () => openSettings("accounts");
 // The hub deletes a subscription row the moment a push service answers 404/410, and a browser can hand this device a replacement
@@ -5777,13 +5850,14 @@ async function ensureThreadLocal(acc, th) {
   bulkLogLoad();
   window.__ensureSearch = ensureSearch;   // NOT reset here: boot awaits IndexedDB first, and a search focused during that window has already started the engine
   if (queue.pending().length) { toast(`${queue.pending().length} pending action(s) resuming`); queue.kick(500); }   // loaded above, before adoption
-  scheduleIdle(backfillUnsub); scheduleIdle(loadUnsubs);
+  scheduleIdle(backfillUnsub); scheduleIdle(() => settingsKept().then(() => settingsFetch()));   // the badge, and Settings ready to draw
   onBroadcast((m) => { // another window of this app: apply its local changes, pick up its queue rows, honour its recent persists
     if (m.type === "thread") { const t = state.threads.get(m.key); if (t && !((t.updatedAt || 0) > (m.patch.updatedAt || 0))) { Object.assign(t, m.patch); idb.putAll("threads", [t]); clearTimeout(onBroadcast._t); onBroadcast._t = setTimeout(() => { render(); updateBadge(); }, 60); } }
     else if (m.type === "queue") queue.load().then(() => queue.kick(200)).catch(() => {});
     else if (m.type === "recent") for (const k of m.keys || []) queue.recent.set(k, Date.now());
   });
   try { await loadAccounts(); } catch (e) { if (!state.signedOut) toast(e.message); return; }
+  impostorKnownNow();   // the impostor banner's list, in the background
   bootStoreReady = true;   // from here a return to the foreground adopts on its own (adoptOnResume): with prefs, mutes and snoozes loaded
   render();
   if (navigator.serviceWorker) { navigator.serviceWorker.register("/sw.js").catch(() => {}); scheduleIdle(() => syncPushSubscription()); navigator.serviceWorker.addEventListener("message", (e) => { const d = e.data || {}; if (d.type === "push") { notePushDelivered(); const acc = d.data?.account; refresh({ silent: true, accounts: acc && acc !== "hub" ? [acc] : ["hub"] }); if (d.data?.kind === "gmail") toast(d.data.title || "New mail"); } if (d.type === "open" && d.url) { const u = new URL(d.url); history.replaceState(history.state, "", u.search || "/"); handleParams(); } }); }

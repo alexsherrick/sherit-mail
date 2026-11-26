@@ -51,6 +51,8 @@
     "POST gmail:threads/g2/modify": {}, "POST gmail:threads/g1/modify": {}, "POST gmail:threads/g3/modify": {}, "POST gmail:threads/g1/trash": {}, "POST gmail:threads/g2/trash": {}, "POST gmail:threads/g3/trash": {}, "POST gmail:threads/g1/untrash": {}, "POST gmail:threads/g2/untrash": {}, "POST gmail:threads/g3/untrash": {}, "POST gmail:messages/send": { id: "sent1", threadId: "g1" }, "POST /api/send": { id: "h1", thread_id: "t1", message_id: "<x@y>" }, "POST /api/schedule": { ok: true, id: "s1" }, "POST /api/sender-rules": { ok: true, rule: { id: "r2", pattern: "x", action: "block", scope: "*" } },
     "GET /api/push/subscriptions": { subscriptions: [] }, "POST /api/push/subscribe": { ok: true, id: "sub-1" }, "DELETE /api/push/subscribe": { ok: true, removed: 1 }, "PUT /api/prefs": { ok: true }, "GET /api/senders?status=pending": { senders: [{ address: "alice@example.com", status: "pending" }] }, "POST /api/senders/bootstrap": { ok: true }, "POST /api/senders": { ok: true }, "GET gmail:labels": { labels: [] }, "POST gmail:labels": { id: "Label_1", name: "Snoozed (Mail)" }, "GET /api/revisit": { items: [] }, "POST gmail:messages/batchModify": {}, "POST /api/threads/bulk": { changed: 2, missing: [], imap_ops: 0 }, "GET /api/unsubscribes": { unsubscribes: [] }, "POST /api/unsubscribe/job": { ok: true },
   };
+  // the domains that have written to the user, for the impostor banner
+  routes["GET /api/senders/orgs"] = { orgs: ["example.com", "shop.example", "list.example"] };
   // recipient suggestions: the hub's address book, and Google's two contact searches (only reached for a token carrying the contacts scope)
   const ago = (d) => new Date(Date.now() - d * 864e5).toISOString();
   routes["GET /api/contacts"] = { sent: [{ addr: "robin@family.example", name: "Robin Owner", n: 9, last: ago(2) }, { addr: "perry@powerparts.example", name: "Perry Mason", n: 3, last: ago(20) }],
@@ -84,7 +86,7 @@
     if (method === "GET" && fid) { if (D.fileDelay) await new Promise((r) => setTimeout(r, D.fileDelay)); const f = D.files.get(fid); if (!f || f.draft !== id) return res(404, { error: "not found" }); return { ok: true, status: 200, blob: async () => f.blob, arrayBuffer: async () => f.blob.arrayBuffer(), headers: new Map() }; }
     return res(404, { error: "no such drafts route" });
   }
-  window.__mock = { routes, calls, errors, hubThreads, failNext: null, drafts: D }; // failNext = { match: /regex on "METHOD key"/, status, body } consumed once
+  window.__mock = { routes, calls, errors, hubThreads, failNext: null, drafts: D, hold: {} }; // failNext = { match: /regex on "METHOD key"/, status, body } consumed once; hold = { "METHOD key": a promise the answer waits for }
   if (typeof window.__mockSetup === "function") window.__mockSetup(window.__mock);   // a test adds its own threads and routes before the app boots
   const realFetch = typeof window.fetch === "function" ? window.fetch.bind(window) : null;   // static files pass through to the test server
   window.fetch = async (url, o = {}) => {
@@ -93,11 +95,19 @@
     if (url.startsWith("https://gmail.googleapis.com/gmail/v1/users/me/")) key = `${method} gmail:` + url.slice("https://gmail.googleapis.com/gmail/v1/users/me/".length);
     else key = `${method} ${url.replace(/^https?:\/\/[^/]+/, "")}`;
     calls.push(key);
+    const held = window.__mock.hold && window.__mock.hold[key]; if (held) await held;   // a test holding an answer back, to see what draws without it
     const fn = window.__mock.failNext; if (fn && fn.match.test(key)) { window.__mock.failNext = null; return { ok: false, status: fn.status, json: async () => fn.body || { error: "injected" }, text: async () => JSON.stringify(fn.body || { error: "injected" }), headers: new Map() }; }
     // Drafts: a small hub of their own, with the real one's rules; revisions, a 409 carrying the current draft, tombstones
     // on the cursor, files kept apart. window.__mock.drafts is that hub's table, for a test to read, or to change as another device would.
     const dm = /^(GET|PUT|DELETE|POST) \/api\/drafts(?:\/([0-9a-f-]{36}))?(\/files(?:\/([0-9a-f-]{36}))?)?(\?.*)?$/.exec(key);
     if (dm) return mockDrafts(dm, o);
+    // Settings' one request, put together at the moment it is asked from the routes it stands for, as the hub does, so a
+    // test that changes one of them sees it in Settings.
+    if (key === "GET /api/settings") {
+      const parts = { push: "/api/push/subscriptions", quiet: "/api/quiet-rules", trash: "/api/trash-rules", locks: "/api/locks", mention: "/api/mention-rules", trackers: "/api/trackers/status", unsubs: "/api/unsubscribes" }, out = {};
+      for (const [k, p] of Object.entries(parts)) { const h = routes["GET " + p]; if (h === undefined) { errors.push("UNMOCKED GET " + p); out[k] = { __error: "unmocked" }; } else out[k] = h && h.__status ? { __error: String(h.__status) } : h; }
+      return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(out)), text: async () => JSON.stringify(out), headers: new Map() };
+    }
     let hit = routes[key]; if (!hit) { const k2 = Object.keys(routes).find((k) => k.endsWith("?") && key.startsWith(k)); if (k2) hit = routes[k2]; }
     if (!hit && /[?&]keep_unread=1$/.test(key)) hit = routes[key.replace(/[?&]keep_unread=1$/, "")];   // the client reads without marking read
     if (!hit) { if (!/batch\/gmail/.test(key)) errors.push("UNMOCKED " + key); return { ok: false, status: 404, json: async () => ({ error: "unmocked " + key }), text: async () => "", headers: new Map() }; }

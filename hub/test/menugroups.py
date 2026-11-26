@@ -36,7 +36,7 @@ SPY = """() => { const sent = window.__sent = []; const f = window.fetch;
   window.fetch = (url, o = {}) => { if (/\\/api\\/(mention-rules|sender-rules|senders$)/.test(String(url)) && (o.method || 'GET') !== 'GET') sent.push({ method: o.method, url: String(url), body: o.body ? JSON.parse(o.body) : null }); return f(url, o); };
   window.__mock.routes['POST /api/sender-rules'] = { ok: true, rule: null };
   window.__mock.routes['POST /api/mention-rules'] = { ok: true, rule: { id: 'aaaaaaaa-0000-0000-0000-0000000000c1', pattern: '*@lakeside.example', scope: 'sam.owner.sxsw@gmail.com', words: ['SXSW', 'South by Southwest'], kept: 0, dropped: 0 } };
-  window.__mock.routes['GET /api/mention-rules'] = { rules: [{ id: 'aaaaaaaa-0000-0000-0000-0000000000c0', pattern: '*@uber.com', scope: 'sam.owner.sxsw@gmail.com', words: ['SXSW', 'South by Southwest'], kept: 0, dropped: 48 }], recent: [] }; }"""
+  window.__mock.routes['GET /api/mention-rules'] = { rules: [{ id: 'aaaaaaaa-0000-0000-0000-0000000000c0', pattern: '*@uber.com', scope: 'sam.owner.sxsw@gmail.com', words: ['SXSW', 'South by Southwest'], kept: 0, dropped: 48 }], recent: [] }; window.mh.state.mention = null; /* the app loads Settings' data at boot; these are the hub's rules from here on */ }"""
 VIS = """(sel) => [...document.querySelectorAll(sel)].filter((b) => getComputedStyle(b).display !== 'none' && b.offsetParent !== null).map((b) => { const r = b.getBoundingClientRect(); return [b.textContent.trim().split(/\s+/)[0], Math.round(r.left), Math.round(r.right)]; })"""   # the first word: a keyboard hint may follow
 
 def tap(page, sel):   # a click that reports a missing or unreachable control as False instead of waiting out its timeout (the CONTROL pass)

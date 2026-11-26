@@ -684,10 +684,11 @@ function urlHash(s) { let h1 = 0xdeadbeef, h2 = 0x41c6ce57; for (let i = 0; i < 
 // its bytes, not the type the sender gave it.
 const IMG_WORK_MIN = 500_000, IMG_WORK_PNG = 20_000, PHONE_W = 1080, IMG_WIDTHS = [1600, 1080];
 const isPngBytes = (b) => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
-function imgKeptRows(db, key, buf, ct) {
+// `org`: the sender whose share the picture spent; the shrinker gives that share back what it saves.
+function imgKeptRows(db, key, buf, ct, org = null) {
   const b = new Uint8Array(buf), s = imgSize(b) || { w: 0, h: 0 }, t = now();
   const rows = [db.prepare("INSERT INTO img_seen (sha, stored_at) VALUES (?, ?) ON CONFLICT(sha) DO NOTHING").bind(key.slice(4), t)];
-  if (buf.byteLength >= IMG_WORK_MIN || s.w > PHONE_W || (buf.byteLength >= IMG_WORK_PNG && isPngBytes(b))) rows.push(db.prepare("INSERT OR IGNORE INTO img_work (key, bytes, ct, w, h, state, at) VALUES (?, ?, ?, ?, ?, 'pending', ?)").bind(key, buf.byteLength, ct || null, s.w || null, s.h || null, t));
+  if (buf.byteLength >= IMG_WORK_MIN || s.w > PHONE_W || (buf.byteLength >= IMG_WORK_PNG && isPngBytes(b))) rows.push(db.prepare("INSERT OR IGNORE INTO img_work (key, bytes, ct, w, h, state, at, dom) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)").bind(key, buf.byteLength, ct || null, s.w || null, s.h || null, t, org && org !== "-" && org !== "+requeue" ? org : null));
   return rows;
 }
 // Whether the hub holds a picture: its original (img/<sha>) or its desktop size (imgv/<sha>-1600), which replaces the original.
@@ -832,18 +833,29 @@ const PREFETCH_DOMAIN_IMAGES = 250, PREFETCH_DOMAIN_BYTES = 15 * 1024 * 1024;
 async function prefetchDomainLeft(env, dom) {
   let images = 0, bytes = 0;
   try {
-    const { results } = await env.DB.prepare("SELECT detail FROM events WHERE at > datetime('now','-1 day') AND kind = 'img_prefetch' AND detail LIKE ?").bind(`% from=${dom} %`).all();
+    const [{ results }, back] = await Promise.all([env.DB.prepare("SELECT detail FROM events WHERE at > datetime('now','-1 day') AND kind = 'img_prefetch' AND detail LIKE ?").bind(`% from=${dom} %`).all(), imgShrunkBack(env.DB, dom)]);
     for (const row of results || []) { images += +(/\bstored=(\d+)/.exec(row.detail || "")?.[1] || 0); bytes += +(/\bbytes=(\d+)/.exec(row.detail || "")?.[1] || 0); }
+    bytes -= back;
   } catch (_) {}
   return { images: PREFETCH_DOMAIN_IMAGES - images, bytes: PREFETCH_DOMAIN_BYTES - bytes };
+}
+// What the shrinker saved on the pictures stored in the last 24 hours, for one sender or (dom undefined) for the day:
+// a picture counts at the size the hub keeps of it, both WebP sizes and the original when it stays, not at the size it was fetched.
+// A newsletter's four PNGs were 13.8 MB fetched and 0.71 MB kept; counted at 13.8 they spent a 15 MB share and withheld its last two.
+async function imgShrunkBack(db, dom) {
+  const since = isoIn(-86400e3);
+  const r = dom === undefined ? await db.prepare("SELECT COALESCE(SUM(bytes - kept), 0) b FROM img_work WHERE state = 'done' AND at > ? AND kept IS NOT NULL AND kept < bytes").bind(since).first()
+    : await db.prepare("SELECT COALESCE(SUM(bytes - kept), 0) b FROM img_work WHERE state = 'done' AND at > ? AND dom = ? AND kept IS NOT NULL AND kept < bytes").bind(since, dom).first();
+  return Number(r?.b) || 0;
 }
 // What may still be stored today: the last 24 hours of prefetches, read back from their own img_prefetch events. Fails open: each
 // mail is still bounded by the per-mail caps above.
 export async function prefetchAllowance(env) {
   let images = 0, bytes = 0;
   try {
-    const { results } = await env.DB.prepare("SELECT detail FROM events WHERE at > datetime('now','-1 day') AND kind IN ('img_prefetch', 'img_open_kept')").all();
+    const [{ results }, back] = await Promise.all([env.DB.prepare("SELECT detail FROM events WHERE at > datetime('now','-1 day') AND kind IN ('img_prefetch', 'img_open_kept')").all(), imgShrunkBack(env.DB)]);
     for (const row of results || []) { images += +(/\bstored=(\d+)/.exec(row.detail || "")?.[1] || 0); bytes += +(/\bbytes=(\d+)/.exec(row.detail || "")?.[1] || 0); }
+    bytes -= back;   // at the size kept
   } catch (_) {}
   return { images: PREFETCH_DAY_IMAGES - images, bytes: PREFETCH_DAY_BYTES - bytes };
 }
@@ -883,14 +895,21 @@ const IMG_QUEUE_PER_MAIL = 200, IMG_RETRY_MS = [15 * 60e3, 2 * 3600e3, 12 * 3600
 const isoIn = (ms) => new Date(Date.now() + ms).toISOString();
 // `org` is the sending organisation whose share of the day the picture spends when the cron fetches it;
 // null for a picture queued again by an Undo or a learned pattern turned off, which no sender chose.
-const imgQueueAhead = (db, href, fetchingUntil, org = null) => db.prepare("INSERT INTO img_queue (hk, url, state, kind, tries, next_at, fetching_until, at, dom) VALUES (?, ?, 'pending', 'new', 0, ?, ?, ?, ?) ON CONFLICT(hk) DO UPDATE SET state = 'pending', fetching_until = excluded.fetching_until, next_at = MAX(next_at, excluded.next_at), dom = COALESCE(excluded.dom, img_queue.dom), at = excluded.at")
-  .bind(urlHash(href), href, isoIn(fetchingUntil ? 120e3 : 0), fetchingUntil, now(), org);
+// `fill` marks a picture queued to catch up old mail: the mirror's picture fill, or a backfill. The drain takes it only
+// after the pictures new mail is waiting for, and only while more than half of the day and of its sender's share is left. New mail
+// wanting the same picture makes it new mail's (MIN).
+const imgQueueAhead = (db, href, fetchingUntil, org = null, fill = 0) => db.prepare("INSERT INTO img_queue (hk, url, state, kind, tries, next_at, fetching_until, at, dom, fill) VALUES (?, ?, 'pending', 'new', 0, ?, ?, ?, ?, ?) ON CONFLICT(hk) DO UPDATE SET state = 'pending', fetching_until = excluded.fetching_until, next_at = MAX(next_at, excluded.next_at), dom = COALESCE(excluded.dom, img_queue.dom), at = excluded.at, fill = MIN(img_queue.fill, excluded.fill)")
+  .bind(urlHash(href), href, isoIn(fetchingUntil ? 120e3 : 0), fetchingUntil, now(), org, fill ? 1 : 0);
 // A held picture that comes in again with new mail starts its 90 days again: the sweep counts from the later of the last showing and the
 // storing (COALESCE(seen_at, stored_at)), and a picture stored three months ago and never shown was swept, so the NEW mail's open fetched
 // it from its sender. Arriving again counts as a showing.
 const imgTouchRow = (db, key) => db.prepare("INSERT INTO img_seen (sha, stored_at, seen_at) VALUES (?, ?, ?) ON CONFLICT(sha) DO UPDATE SET seen_at = excluded.seen_at").bind(key.slice(4), now(), now());
 const imgQueueDone = (db, href) => db.prepare("DELETE FROM img_queue WHERE hk = ?").bind(urlHash(href));
 const imgQueueLater = (db, href, kind, ms) => db.prepare("UPDATE img_queue SET kind = ?, next_at = ?, fetching_until = NULL, last_at = ? WHERE hk = ?").bind(kind, isoIn(ms), now(), urlHash(href));
+// Fetched and found not to fit what is left: its size is kept, so the drain asks the sender for it again only once it
+// fits. It had downloaded it every hour to find out, 7 MB an hour for a newsletter's last two pictures. The shrinker makes the sender's
+// waiting pictures due as soon as it gives the share back, and the hour stays as the fallback.
+const imgQueueOver = (db, href, size) => db.prepare("UPDATE img_queue SET kind = 'over', size = ?, next_at = ?, fetching_until = NULL, last_at = ? WHERE hk = ?").bind(size, isoIn(IMG_OVER_WAIT_MS), now(), urlHash(href));
 function imgQueueFailed(db, href, { big = false, permanent = false, note = "" } = {}) {
   return db.prepare("UPDATE img_queue SET kind = ?, tries = tries + 1, state = CASE WHEN ? = 1 OR tries + 1 >= 4 THEN 'dead' ELSE 'pending' END, next_at = CASE WHEN ? = 1 THEN ? WHEN tries + 1 = 1 THEN ? WHEN tries + 1 = 2 THEN ? ELSE ? END, fetching_until = NULL, note = ?, last_at = ? WHERE hk = ?")
     .bind(big ? "big" : "fail", permanent ? 1 : 0, big ? 1 : 0, isoIn(60e3), isoIn(IMG_RETRY_MS[0]), isoIn(IMG_RETRY_MS[1]), isoIn(IMG_RETRY_MS[2]), String(note || "failed").slice(0, 80), now(), urlHash(href));
@@ -911,7 +930,7 @@ export async function prefetchImages(env, html, tag, o = {}) {
   const org = dom || "-";
   // Queued only (o.queueOnly: the mirror's picture fill, gmailPicFill): every row is due now and the cron's drain fetches it, under the
   // same allowance and shares; nothing is fetched here.
-  if (o.queueOnly) { try { await env.DB.batch(all.map((h) => imgQueueAhead(env.DB, h, null, org))); } catch (_) { return { n: 0, queued: 0, blocked: hits.length }; } return { n: all.length, queued: all.length, blocked: hits.length }; }
+  if (o.queueOnly) { try { await env.DB.batch(all.map((h) => imgQueueAhead(env.DB, h, null, org, 1))); } catch (_) { return { n: 0, queued: 0, blocked: hits.length }; } return { n: all.length, queued: all.length, blocked: hits.length }; }
   try { await env.DB.batch(all.map((h, i) => imgQueueAhead(env.DB, h, i < urls.length ? busy : null, org))); } catch (_) {}
   const left = o.left || (await prefetchAllowance(env));
   const mine = await prefetchDomainLeft(env, org);   // this sender's share left today
@@ -939,11 +958,11 @@ export async function prefetchImages(env, html, tag, o = {}) {
     const got = await fetchImageSafely(u, PREFETCH_IMG_MAX); if (!got.ok) return fail(href, { big: got.msg === "too large", permanent: got.status === 415, note: got.msg });
     const buf = await new Response(got.body).arrayBuffer().catch(() => null); if (!buf) return fail(href, { big: true, note: "stream over the arrival cap or cut" });
     if (r.bytes + buf.byteLength > PREFETCH_MAX_BYTES) { r.failed++; queue.push(imgQueueLater(db, href, "new", 0)); return; }   // the mail's own byte cap: the cron keeps it
-    if (left.images <= 0 || buf.byteLength > left.bytes || mine.images <= 0 || buf.byteLength > mine.bytes) { r.over++; queue.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
+    if (left.images <= 0 || buf.byteLength > left.bytes || mine.images <= 0 || buf.byteLength > mine.bytes) { r.over++; queue.push(imgQueueOver(db, href, buf.byteLength)); return; }
     left.images--; left.bytes -= buf.byteLength; mine.images--; mine.bytes -= buf.byteLength; r.bytes += buf.byteLength;
     await env.STORE.put(key, buf, { httpMetadata: { contentType: got.ct }, customMetadata: { at: now(), via: "arrival" } }); r.stored++; queue.push(imgQueueDone(db, href));
     const row = imgDimsRow(env.DB, href, buf); if (row) dims.push(row); seenAs(href, imgSize(new Uint8Array(buf)));
-    queue.push(...imgKeptRows(env.DB, key, buf, got.ct));   // not in dims: r.sized counts measured pictures
+    queue.push(...imgKeptRows(env.DB, key, buf, got.ct, org));   // not in dims: r.sized counts measured pictures
   };
   const lane = async () => { while (next < urls.length && Date.now() < until) { const href = urls[next++]; await one(href).catch((e) => fail(href, { note: "error " + String(e?.message || e) })); } };
   await Promise.all(Array.from({ length: Math.min(4, urls.length) }, lane));
@@ -960,19 +979,26 @@ export async function prefetchImages(env, html, tag, o = {}) {
 // an arrival's, one per sending organisation (from=…) and one for the rest, so the allowance and each share count it exactly once; it
 // had counted only the allowance, and one sender's queued pictures took all 250 MB. Nothing here is
 // started by an open, so nothing it asks of a sender says when a mail was read.
+// A picture that catches up old mail (fill) comes after every picture new mail is waiting for, and keeps half of the day
+// and half of its sender's share for new mail: a backfill on 2026-11-24 spent google.com's whole share in four minutes, and the next
+// morning's mail from Google had 8 of its 21 pictures withheld until that spending was 24 hours old.
+const IMG_FILL_KEEP = { images: PREFETCH_DAY_IMAGES / 2, bytes: PREFETCH_DAY_BYTES / 2 }, IMG_FILL_KEEP_DOM = { images: PREFETCH_DOMAIN_IMAGES / 2, bytes: PREFETCH_DOMAIN_BYTES / 2 };
 export async function drainImgQueue(env, { max = 12, budgetMs = 15_000 } = {}) {
   const db = env.DB, t0 = Date.now(), at = now(); let rows;
-  try { rows = (await db.prepare("SELECT hk, url, dom FROM img_queue WHERE state = 'pending' AND next_at <= ? AND (fetching_until IS NULL OR fetching_until < ?) ORDER BY next_at LIMIT ?").bind(at, at, max).all()).results || []; } catch (_) { return { n: 0 }; }
+  try { rows = (await db.prepare("SELECT hk, url, dom, fill, size FROM img_queue WHERE state = 'pending' AND next_at <= ? AND (fetching_until IS NULL OR fetching_until < ?) ORDER BY fill, next_at LIMIT ?").bind(at, at, max).all()).results || []; } catch (_) { return { n: 0 }; }
   if (!rows.length) return { n: 0 };
   await trkLoad(env).catch(() => {});
   const left = await prefetchAllowance(env), r = { n: rows.length, stored: 0, had: 0, failed: 0, over: 0, dropped: 0, bytes: 0 }, writes = []; let next = 0;
   const shares = new Map(), kept = new Map();   // each organisation's share left today, read once a run; what was kept for it
   const shareOf = (org) => { if (!shares.has(org)) shares.set(org, prefetchDomainLeft(env, org)); return shares.get(org); };
-  const one = async ({ url: href, dom: org }) => {
+  const one = async ({ url: href, dom: org, fill, size }) => {
     const key = await imgKey(href);
     if (await imgHeld(env, key)) { r.had++; writes.push(imgQueueDone(db, href), imgTouchRow(db, key)); return; }
     const mine = org ? await shareOf(org) : null;
-    if (left.images <= 0 || left.bytes <= 0 || (mine && (mine.images <= 0 || mine.bytes <= 0))) { r.over++; writes.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
+    const kd = fill ? IMG_FILL_KEEP : { images: 0, bytes: 0 }, km = fill ? IMG_FILL_KEEP_DOM : { images: 0, bytes: 0 };   // what this picture must leave
+    if (left.images <= kd.images || left.bytes <= kd.bytes || (mine && (mine.images <= km.images || mine.bytes <= km.bytes))) { r.over++; writes.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
+    // known not to fit what is left: not fetched to find out again
+    if (size > 0 && (size > left.bytes - kd.bytes || (mine && size > mine.bytes - km.bytes))) { r.over++; writes.push(imgQueueOver(db, href, size)); return; }
     let u; try { u = new URL(href); } catch (_) { u = null; }
     // a list or a learned pattern may have come to block it since its mail arrived
     const v = u && trkVerdict(u.href, null); if (v) { r.dropped++; writes.push(imgQueueDone(db, href), trkVerdictRow(db, { href: u.href, ...v })); return; }
@@ -981,13 +1007,13 @@ export async function drainImgQueue(env, { max = 12, budgetMs = 15_000 } = {}) {
     if (!got.ok) { r.failed++; writes.push(imgQueueFailed(db, href, { permanent: got.status === 415 || got.status === 413, note: got.msg })); return; }
     const buf = await new Response(got.body).arrayBuffer().catch(() => null);
     if (!buf) { r.failed++; writes.push(imgQueueFailed(db, href, { note: "stream over the open cap or cut" })); return; }
-    if (left.images <= 0 || buf.byteLength > left.bytes || (mine && (mine.images <= 0 || buf.byteLength > mine.bytes))) { r.over++; writes.push(imgQueueLater(db, href, "over", IMG_OVER_WAIT_MS)); return; }
+    if (left.images <= kd.images || buf.byteLength > left.bytes - kd.bytes || (mine && (mine.images <= km.images || buf.byteLength > mine.bytes - km.bytes))) { r.over++; writes.push(imgQueueOver(db, href, buf.byteLength)); return; }
     left.images--; left.bytes -= buf.byteLength; if (mine) { mine.images--; mine.bytes -= buf.byteLength; }
     await env.STORE.put(key, buf, { httpMetadata: { contentType: got.ct }, customMetadata: { at: now(), via: "queue" } }); r.stored++; r.bytes += buf.byteLength; writes.push(imgQueueDone(db, href));
     if (mine) { const k = kept.get(org) || { stored: 0, bytes: 0 }; k.stored++; k.bytes += buf.byteLength; kept.set(org, k); }   // counted once stored
     const d = imgDimsRow(db, href, buf); if (d) writes.push(d);
     const s = imgSize(new Uint8Array(buf)); if (s) writes.push(trkObsRow(db, href, s.w, s.h, null, null));   // a size, no new sighting
-    writes.push(...imgKeptRows(db, key, buf, got.ct));
+    writes.push(...imgKeptRows(db, key, buf, got.ct, org));
   };
   const lane = async () => { while (next < rows.length && Date.now() - t0 < budgetMs) { const row = rows[next++]; await one(row).catch((e) => { r.failed++; writes.push(imgQueueFailed(db, row.url, { note: "error " + String(e?.message || e) })); }); } };
   await Promise.all([lane(), lane()]);
@@ -1373,19 +1399,27 @@ export async function trkPrune(env) {
     env.DB.prepare("DELETE FROM trk_rules WHERE kind = 'learned' AND state IN ('watch', 'on') AND created_at < ? AND NOT EXISTS (SELECT 1 FROM trk_obs o WHERE o.pattern = trk_rules.pattern)").bind(isoIn(-TRK_KEEP_MS))]); } catch (_) {}
 }
 // For Settings and the daily report.
+// Its reads go out at once: one after another they were the slowest part of opening Settings, 0.39 s of 1.0.
 export async function trkStatus(env) {
   const db = env.DB, q = async (sql, ...b) => (await db.prepare(sql).bind(...b).all()).results || [];
-  const learner = (await trkMetaGet(db, "learner")) || { mode: "watch", since: null };
-  const rules = await q("SELECT pattern, kind, state, tiny, mails, sender, note, created_at, changed_at, on_at FROM trk_rules ORDER BY changed_at DESC LIMIT 300");
-  const per = new Map((await q("SELECT rule, COUNT(*) n FROM trk_verdict WHERE gone = 0 GROUP BY rule")).map((r) => [r.rule, r.n]));
+  const [learnerRow, rules, perRows, recentRows, metas, dayRows] = await Promise.all([
+    trkMetaGet(db, "learner"),
+    q("SELECT pattern, kind, state, tiny, mails, sender, note, created_at, changed_at, on_at FROM trk_rules ORDER BY changed_at DESC LIMIT 300"),
+    q("SELECT rule, COUNT(*) n FROM trk_verdict WHERE gone = 0 GROUP BY rule"),
+    q("SELECT url, name, cls, rule, pat FROM trk_verdict WHERE gone = 0 AND at > ? ORDER BY seq DESC LIMIT 3000", isoIn(-14 * 86400e3)),
+    Promise.all(TRK_LISTS.map((L) => trkMetaGet(db, "list:" + L.key))),
+    q("SELECT (SELECT COUNT(*) FROM trk_verdict WHERE gone = 0 AND at > ?) blocked, (SELECT COUNT(*) FROM trk_obs WHERE w BETWEEN 1 AND 2 AND h BETWEEN 1 AND 2 AND first_at > ?) slipped", isoIn(-86400e3), isoIn(-86400e3)),
+  ]);
+  const learner = learnerRow || { mode: "watch", since: null };
+  const per = new Map(perRows.map((r) => [r.rule, r.n]));
   for (const r of rules) r.blocked = per.get("learned:" + r.pattern) || 0;
   const recent = new Map();
-  for (const x of await q("SELECT url, name, cls, rule, pat FROM trk_verdict WHERE gone = 0 AND at > ? ORDER BY seq DESC LIMIT 3000", isoIn(-14 * 86400e3))) {
+  for (const x of recentRows) {
     const p = x.pat || trkPattern(x.url), e = recent.get(p) || { pattern: p, name: x.name, cls: x.cls, source: x.rule.split(":")[0], n: 0 }; e.n++; recent.set(p, e);
   }
   const lists = [];
-  for (const L of TRK_LISTS) { const m = await trkMetaGet(db, "list:" + L.key); lists.push({ name: L.name, cls: L.cls, version: m?.version || null, rules: m?.rules || 0, refused: (m?.dropped || []).length, blocked: m?.blocked ?? null, of: m?.of ?? null, checked: m?.checked ?? 0, at: m?.at || null }); }
-  const day = (await q("SELECT (SELECT COUNT(*) FROM trk_verdict WHERE gone = 0 AND at > ?) blocked, (SELECT COUNT(*) FROM trk_obs WHERE w BETWEEN 1 AND 2 AND h BETWEEN 1 AND 2 AND first_at > ?) slipped", isoIn(-86400e3), isoIn(-86400e3)))[0] || {};
+  for (const [i, L] of TRK_LISTS.entries()) { const m = metas[i]; lists.push({ name: L.name, cls: L.cls, version: m?.version || null, rules: m?.rules || 0, refused: (m?.dropped || []).length, blocked: m?.blocked ?? null, of: m?.of ?? null, checked: m?.checked ?? 0, at: m?.at || null }); }
+  const day = dayRows[0] || {};
   return { learner, on_at: learner.mode === "watch" && learner.since ? new Date(Date.parse(learner.since) + TRK_WATCH_MS).toISOString() : null, rules, recent: [...recent.values()].sort((a, b) => b.n - a.n).slice(0, 40), lists, day };
 }
 // A Gmail message's HTML body, from messages.get format=full: the first text/html part, base64url-decoded.
@@ -2148,7 +2182,7 @@ async function projectInbound(env, raw, o) {
 
   let ingested = null;
   try {
-  ingested = await ingestRaw(env, raw, { id, at, rcpt, envFrom, source: "cloudflare", rawKey, gmailForwardedAt: forwardedAt, gmailCopy: hold ? "held" : (forwardedAt ? "hub" : (copyWanted ? "none" : "off")), label: kept ? "locked-out" : rateLimited ? "rate-limited" : (overBudget ? "over-budget" : label), kept, trashRules: trashRulesLoader(db), mentionRules: mentionRulesLoader(db), subjectHdr, msgIdHdr, parsed, storeOnly: raw.byteLength > INBOUND_PARSE_MAX || rateLimited || overBudget });
+  ingested = await ingestRaw(env, raw, { id, at, rcpt, envFrom, source: "cloudflare", rawKey, gmailForwardedAt: forwardedAt, gmailCopy: hold ? "held" : (forwardedAt ? "hub" : (copyWanted ? "none" : "off")), label: kept ? "locked-out" : rateLimited ? "rate-limited" : (overBudget ? "over-budget" : label), kept, trashRules: trashRulesLoader(db), mentionRules: mentionRulesLoader(db), impostorKnown: () => impostorKnown(env), subjectHdr, msgIdHdr, parsed, storeOnly: raw.byteLength > INBOUND_PARSE_MAX || rateLimited || overBudget });
   } catch (e) {
     // Only a genuinely present row means the other side won. Anything else is a real failure and must stay queued.
     if (!(await indexedAlready())) throw e;
@@ -2170,6 +2204,8 @@ async function projectInbound(env, raw, o) {
   // still-mailing note. The rule counts it.
   if (ingested?.trashRule) { await trashHit(db, ingested.trashRule, `${rcpt} <- ${addrOnly(hdrFrom || envFrom)}`, id); return; }
   if (ingested?.mentionDrop) return;   // a "Delete unless it mentions…" rule filed it in Trash: no push, no gatekeeper
+  // An impostor: filed in Spam (ingestRaw), no push, and no gatekeeper, so its sender is not recorded.
+  if (ingested?.impostor) { await logEvent(db, "impostor_spam", id, `${rcpt} <- ${addrOnly(hdrFrom || envFrom)}: ${impostorWhy(ingested.impostor)} | ${String(subjectHdr || "").slice(0, 120)}`); return; }
 
   // Gatekeeper + push (content stays in the hub's own store; the push carries only the account, sender and subject)
   try {
@@ -2360,12 +2396,15 @@ async function ingestRaw(env, raw, o) {
   // subject before the message is threaded. Fails open: rules that cannot be read file the message as before.
   let trashRule = null;
   if (!o.kept && o.trashRules) { try { trashRule = trashMatch(await o.trashRules(), { name: from?.name || "", subject, account: rcpt }); } catch (_) { trashRule = null; } }
+  // An impostor, for the caller that asks (Cloudflare): filed in Spam on a conversation of its own, unannounced.
+  let impostor = null;
+  if (!o.kept && !trashRule && !out && o.impostorKnown) { try { impostor = impostorOf(from?.name || "", from?.address || o.envFrom || "", await o.impostorKnown()); } catch (_) { impostor = null; } }
   // "Delete unless it mentions…" on mail at your own domains and the work mailbox: a rule scoped "hub" covering the
   // sender, decided on the parsed text as mentionDecide decides a Gmail message. A word keeps it (and it is announced as usual); almost
   // no text of its own keeps it; a reply in a conversation you wrote in is left; otherwise it is filed in Trash on a conversation of its
   // own, as a trash rule's match is, unannounced. Fails open: rules that cannot be read file the message as before.
   let mention = null;
-  if (!o.kept && !trashRule && !out && p && o.mentionRules) {
+  if (!o.kept && !trashRule && !impostor && !out && p && o.mentionRules) {
     try {
       const rules = (await o.mentionRules()).filter((r) => r.scope === MENTION_HUB), sender = from?.address || o.envFrom || "";
       const r = rules.length ? matchMention(rules, sender, MENTION_HUB) : null;
@@ -2378,12 +2417,13 @@ async function ingestRaw(env, raw, o) {
     } catch (_) { mention = null; }
   }
   const mentionDrop = mention?.decision === "dropped";
-  const label = trashRule ? "trash-rule" : mentionDrop ? "mention-rule" : o.label;
+  const label = trashRule ? "trash-rule" : mentionDrop ? "mention-rule" : impostor ? "impostor" : o.label;
   // Mail an address lock kept out gets a thread of its own, created archived: it never joins, revives or moves a
   // conversation that holds wanted mail, and archived is out of the inbox without being purged as trash is after 30 days.
   // Mail a trash rule matched gets one too, created in Trash: it never joins, revives or trashes a wanted conversation.
   const tw = o.kept ? threadWrite(db, null, { subjectNorm, participants, at, newState: "archived" })
     : trashRule || mentionDrop ? threadWrite(db, null, { subjectNorm, participants, at, newState: "trash" })
+    : impostor ? threadWrite(db, null, { subjectNorm, participants, at, newState: "spam" })
     : threadWrite(db, await resolveThread(db, { inReplyTo, references: refs, subjectNorm, participants }), { subjectNorm, participants, at, newState: out ? "archived" : "inbox" }); const threadId = tw.id;
 
   const gmailCopy = o.gmailCopy || (o.gmailForwardedAt ? "hub" : "none");
@@ -2400,7 +2440,7 @@ async function ingestRaw(env, raw, o) {
   // Only the NEWEST message of a conversation marks it unread and brings it back from Archive or Trash. An older one (a backfill of
   // a work mailbox, a late copy) joins it quietly: importing 160 old messages must not resurrect what was put away.
   const newest = !th?.last_message_at || String(at) >= String(th.last_message_at);
-  const lift = newest && !o.kept && !trashRule && !mentionDrop && !out;   // kept-out, rule-trashed and sent mail neither marks its thread unread nor brings it to the inbox
+  const lift = newest && !o.kept && !trashRule && !mentionDrop && !impostor && !out;   // kept-out, rule-trashed and sent mail neither marks its thread unread nor brings it to the inbox
   const hdrs = {}; try { for (const hh of (p?.headers || [])) hdrs[lc(hh.key)] = hh.value; } catch (_) {}
   const { results: catRules } = await db.prepare("SELECT pattern, action, scope, category FROM sender_rules WHERE category IS NOT NULL").all();
   const category = categorizeHeaders(hdrs, from?.address || o.envFrom || "", matchSender(catRules, from?.address || o.envFrom || "", rcpt));
@@ -2426,14 +2466,14 @@ async function ingestRaw(env, raw, o) {
   }
   // The images of mail that reaches the inbox are fetched now, while nobody is reading it; never for held, blocked,
   // rate-limited, over-budget or unparsed mail, or a thread already in trash or spam.
-  if (html && !out && !o.storeOnly && o.gmailCopy !== "held" && !["trademark-scam", "blocked", "rate-limited", "over-budget", "locked-out", "trash-rule", "mention-rule"].includes(label) && !["trash", "spam"].includes(th?.state)) ctxWaitUntil(prefetchImages(env, html, `hub:${id}`, { from: from?.address }));
+  if (html && !out && !o.storeOnly && o.gmailCopy !== "held" && !["trademark-scam", "blocked", "rate-limited", "over-budget", "locked-out", "trash-rule", "mention-rule", "impostor"].includes(label) && !["trash", "spam"].includes(th?.state)) ctxWaitUntil(prefetchImages(env, html, `hub:${id}`, { from: from?.address }));
   if (mention) {
     try { await db.batch([db.prepare("INSERT INTO mention_decisions (account, id, rule_id, decision, from_addr, subject, at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account, id) DO NOTHING").bind(MENTION_HUB, id, mention.rule.id, mention.decision, lc(mention.sender), String(subject || "").slice(0, 300), now()),
       db.prepare(`UPDATE mention_rules SET ${mentionDrop ? "dropped = dropped + 1" : "kept = kept + 1"}, last_at = ? WHERE id = ?`).bind(now(), mention.rule.id)]); }
     catch (e) { await logEvent(db, "mention_record_fail", id, `hub ${mention.decision}: ${String(e?.message || e).slice(0, 120)}`); }
     await logEvent(db, "mention_" + mention.decision, id, `${rcpt} <- ${lc(mention.sender)} | ${String(subject || "").slice(0, 120)}`);
   }
-  return { id, threadId, messageId, trashRule, mentionDrop };
+  return { id, threadId, messageId, trashRule, mentionDrop, impostor };
 }
 
 // Bridge/backfill from a Resend Receiving account: pull every received email not already held (by Message-ID),
@@ -3173,6 +3213,18 @@ async function api(request, env, url) {
         return { senders: results, counts: Object.fromEntries(counts.results.map((r) => [r.status, r.n])) }; }),
     ]);
     return json({ me, gmail, prefs, push, rules, schedule, senders, version: await appVersion() }); // folds /api/version in too: the eighth round trip
+  }
+  // Settings' data in ONE round trip. The screen awaited seven GETs one after another before it drew anything: 1.0 s
+  // from my Mac on 2026-11-25, more on a phone. Each part is answered by the very route it replaces, through this function,
+  // all at once, so the payloads cannot drift apart; a part that fails comes back as { __error } and the app keeps what it had for it.
+  if (request.method === "GET" && path === "/api/settings") {
+    const parts = { push: "/api/push/subscriptions", quiet: "/api/quiet-rules", trash: "/api/trash-rules", locks: "/api/locks", mention: "/api/mention-rules", trackers: "/api/trackers/status", unsubs: "/api/unsubscribes" };
+    const out = {};
+    await Promise.all(Object.entries(parts).map(async ([k, p]) => {
+      try { const u = new URL(p, url.origin), r = await api(new Request(u, { headers: request.headers }), env, u); out[k] = r.ok ? await r.json() : { __error: String(r.status) }; }
+      catch (e) { out[k] = { __error: String(e?.message || e) }; }
+    }));
+    return json(out, 200, { "cache-control": "no-store" });
   }
   if (request.method === "GET" && path === "/api/me") {
     const { results } = await db.prepare("SELECT email, display_name, domain FROM identities WHERE is_active = 1 ORDER BY email").all();
@@ -4007,6 +4059,8 @@ async function api(request, env, url) {
     const sent = (await db.prepare(`${sentFrom("to_addrs")} UNION ALL ${sentFrom("cc_addrs")} LIMIT 5000`).all()).results.filter((r) => r.addr && r.addr.includes("@"));
     return json({ received, sent });
   }
+  // The domains that have written to the user, for the app's impostor banner: read once a session.
+  if (request.method === "GET" && path === "/api/senders/orgs") return json({ orgs: await impostorOrgs(env) });
   if (request.method === "GET" && path === "/api/senders") {
     const status = url.searchParams.get("status") || "pending";
     const { results } = await db.prepare("SELECT * FROM known_senders WHERE status = ? ORDER BY last_seen_at DESC LIMIT 500").bind(status).all();
@@ -5715,6 +5769,62 @@ export function trashMatch(rules, { name, subject, account }) {
   }
   return null;
 }
+// ---------- Named after a company the user gets mail from, sent from somewhere else ----------
+// Three fakes reached the main Gmail inbox in two days under one company's name, each from noreply@ a different unrelated domain
+// through that domain's own SendGrid account, so every sender check passed; the company's real mail comes from its own domain. The
+// "real or fake" brand table (trust.js) knows only invitation and file-sharing brands, so it said nothing.
+// A sender is an impostor when all of these hold:
+//  - its name is a company's name: its first one to three words, run together, are the name of a domain the user gets mail from
+//  ("Northwind" → northwind.com, "Blue Harbor" → blueharbor.com), and any words after them are plain ones ("Alerts", "Support");
+//  - its address does not carry that name, so it is not the company's own mail service ("<company>@mail.sailthru.com",
+//  "<company>@emails.thanx.com" and "support@<company>support.freshdesk.com" are genuine);
+//  - nobody at its domain has written to the user before: a company's mail service sends a lot (a ticket seller's from
+//  socialtoaster.com, Meta's from facebookmail.com), a hijacked account just once.
+// The companies and the domains that have written are the user's known senders, less those blocked, plus the hub's own domains.
+// Replayed over the 4,951 messages the hub held on 2026-11-25 (the Gmail mirror since July, hub mail and the work mailbox): 4 flagged,
+// all fakes (the three above and one under a bank's name); without the last condition, 16, the other 12 genuine.
+// The same functions are in trust.js for the app's banner; test/impostor.mjs holds the two identical.
+const impostorRoot = lockRoot;
+const IMPOSTOR_PLAIN = new Set("team support alerts alert security secure notifications notification notify account accounts billing service services customer customers care help helpdesk info news newsletter membership member members official online noreply no reply donotreply mail email center centre department dept updates update verification verify fraud protection payments payment rewards inc llc corp hq us usa".split(" "));
+function impostorOf(name, addr, known) {
+  const a = String(addr || "").toLowerCase(), i = a.lastIndexOf("@"); if (i < 1 || !known) return null;
+  const org = impostorRoot(a.slice(i + 1)); if (!org || known.orgs.has(org)) return null;
+  const flat = a.replace(/[^a-z0-9]/g, "");
+  const shown = String(name || "").replace(/[^A-Za-z0-9]+/g, " ").trim().split(" ").filter(Boolean), words = shown.map((w) => w.toLowerCase());
+  if (words[0] === "the") { words.shift(); shown.shift(); }
+  for (let k = 1; k <= Math.min(3, words.length); k++) {
+    const cand = words.slice(0, k).join("");
+    if (cand.length < 3 || !words.slice(k).every((w) => IMPOSTOR_PLAIN.has(w))) continue;
+    if (flat.includes(cand)) return null;
+    const real = [...(known.byLabel.get(cand) || [])].filter((o) => o !== org).sort();
+    if (real.length) return { name: shown.slice(0, k).join(" "), real: real[0], org };
+  }
+  return null;
+}
+// The domains that have written to the user (known senders not blocked) and the user's own, each also under its name:
+// "northwind.com" under "northwind".
+function impostorKnownOf(orgList) {
+  const orgs = new Set(), byLabel = new Map();
+  for (const x of orgList || []) {
+    const o = impostorRoot(x); if (!o) continue; orgs.add(o);
+    const l = o.split(".")[0].replace(/[^a-z0-9]/g, ""); if (l.length >= 3) { if (!byLabel.has(l)) byLabel.set(l, new Set()); byLabel.get(l).add(o); }
+  }
+  return { orgs, byLabel };
+}
+// Read once per isolate every five minutes; a sender judged an impostor is never added to the known senders, so its domain stays new.
+async function impostorOrgs(env) {
+  const { results } = await env.DB.prepare("SELECT address FROM known_senders WHERE status != 'blocked'").all();
+  const out = new Set([...(await ownDomains(env.DB, env))].map(impostorRoot));
+  for (const r of results || []) { const d = String(r.address || "").toLowerCase().split("@")[1]; if (d) out.add(impostorRoot(d)); }
+  out.delete(""); return [...out].sort();
+}
+let impostorCache = { at: 0, v: null };
+async function impostorKnown(env) {
+  if (impostorCache.v && Date.now() - impostorCache.at < 5 * 60e3) return impostorCache.v;
+  impostorCache = { at: Date.now(), v: impostorKnownOf(await impostorOrgs(env)) };
+  return impostorCache.v;
+}
+const impostorWhy = (v) => `named "${v.name}", whose mail comes from ${v.real}; this came from ${v.org}`;
 async function trashHit(db, r, what, messageId = null) {
   try { await db.prepare("UPDATE trash_rules SET hits = hits + 1, last_hit_at = ? WHERE id = ?").bind(now(), r.id).run(); } catch (_) {}
   await logEvent(db, "rule_trashed", messageId, `${what} (rule ${r.scope}${r.name ? ` name "${r.name}"` : ""}${r.subject ? ` subject "${r.subject}"` : ""})`.slice(0, 300));
@@ -6762,10 +6872,18 @@ async function gmailPollOnce(env, a, rules, policy, { spam = [] } = {}) {
     const addr = addrOnly(from);
     // One of my trash rules decides first: to Gmail's Trash, with no notification. Gmail hands the headers
     // over decoded (none of the 3,844 stored in the mirror holds an encoded word). If Gmail refuses the trash, the mail is handled as usual.
-    const tr = trashMatch(await trashRules(), { name: from.includes("<") ? from.slice(0, from.lastIndexOf("<")).replace(/"/g, "").trim() : "", subject, account: a.email });
+    const fromName = from.includes("<") ? from.slice(0, from.lastIndexOf("<")).replace(/"/g, "").trim() : "";
+    const tr = trashMatch(await trashRules(), { name: fromName, subject, account: a.email });
     if (tr) {
       try { await gmailApi(at, `messages/${id}/trash`, { method: "POST", body: "{}" }); ruled++; await trashHit(db, tr, `${a.email} <- ${addr}`); continue; }
       catch (e) { await logEvent(db, "rule_trash_fail", null, `${a.email} ${id} ${e?.message}`); }
+    }
+    // An impostor goes to Gmail's Spam, with no notification, and its sender is not recorded. If Gmail refuses the
+    // move, or the known senders cannot be read, the mail is handled as usual.
+    let imp = null; try { imp = impostorOf(fromName, addr, await impostorKnown(env)); } catch (_) { imp = null; }
+    if (imp) {
+      try { await gmailApi(at, `messages/${id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: ["SPAM"], removeLabelIds: ["INBOX"] }) }); await logEvent(db, "impostor_spam", null, `${a.email} ${id} <- ${addr}: ${impostorWhy(imp)} | ${String(subject || "").slice(0, 120)}`); continue; }
+      catch (e) { await logEvent(db, "impostor_spam_fail", null, `${a.email} ${id} ${e?.message}`); }
     }
     const rule = matchSender(rules, addr, a.email);
     // A "delete unless it mentions" rule decides first. An address-level block still wins; a domain block gives way only to

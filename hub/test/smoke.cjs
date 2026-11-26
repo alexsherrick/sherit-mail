@@ -1081,6 +1081,14 @@ w.addEventListener("error", (e) => errors.push("window error: " + (e.error?.stac
     chk(!div.querySelector(".trustbar"), "your own sent mail is never assessed");
     const calls0 = calls.length; div.innerHTML = w.mh.messageHtml(genuine, 0, 1, []); w.mh.fillTrustAges(div); await sleep(30);
     chk(!calls.slice(calls0).some((c) => /domain-age/.test(c)), "a message with no banner asks nothing of the network");
+    // an impostor: named after a company the user gets mail from (the mock's list has shop.example), from a new domain
+    const imp = { id: "im1", from: "Shop <noreply@otherco.example>", fromAddr: "noreply@otherco.example", to: "sam@x.com", subject: "New Login Detected", date: Date.now(), html: "<p>A new sign-in to your Shop account.</p>" };
+    chk(calls.some((c) => /\/api\/senders\/orgs/.test(c)), "the app asked the hub once for the domains that have written");
+    div.innerHTML = w.mh.messageHtml(imp, 0, 1, []);
+    const ib = div.querySelector(".trustbar.danger");
+    chk(!!ib && /Named Shop, but it wasn't sent by Shop\./.test(ib.textContent) && /shop\.example/.test(ib.textContent) && /Nobody at otherco\.example has written to you before/.test(ib.textContent), `an impostor shows "Probably fake — Named Shop…" with where Shop's mail comes from (${ib && ib.textContent})`);
+    div.innerHTML = w.mh.messageHtml({ ...imp, from: "Shop <noreply@shop.example>", fromAddr: "noreply@shop.example" }, 0, 1, []);
+    chk(!div.querySelector(".trustbar"), "the company's own mail shows nothing");
     div.remove();
   }
   // ---- A conversation with no messages has nobody to reply to. The reply box used to appear holding the PREVIOUS

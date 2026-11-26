@@ -67,8 +67,10 @@ const isWebp = (b) => b.length > 12 && String.fromCharCode(...b.subarray(0, 4)) 
 export async function shrinkOne(env, row, r) {
   const db = env.DB, sha = row.key.slice(4);
   // Fenced by the claim: a run whose claim was taken back (it ran past ten minutes, or was killed) writes nothing over the next one's.
-  const mark = (state, x = {}) => db.prepare("UPDATE img_work SET state = ?, out_bytes = ?, tries = ?, note = ?, done_at = ?, claimed_at = NULL WHERE key = ? AND state = 'working' AND claimed_at = ?")
-    .bind(state, x.out ?? null, x.tries ?? row.tries, x.note ?? null, state === "pending" ? null : now(), row.key, row.claim).run();
+  // `kept`: what the hub keeps of the picture now, both sizes and the original when it stays; its sender's share of the
+  // day counts the picture at this size, not at the size it was fetched.
+  const mark = (state, x = {}) => db.prepare("UPDATE img_work SET state = ?, out_bytes = ?, kept = ?, tries = ?, note = ?, done_at = ?, claimed_at = NULL WHERE key = ? AND state = 'working' AND claimed_at = ?")
+    .bind(state, x.out ?? null, x.kept ?? null, x.tries ?? row.tries, x.note ?? null, state === "pending" ? null : now(), row.key, row.claim).run();
   try {
     if (row.bytes > IMG.maxBytes) { await mark("skipped", { note: `over ${IMG.maxBytes} bytes` }); r.skipped++; return; }
     const obj = await env.STORE.get(row.key);
@@ -93,7 +95,12 @@ export async function shrinkOne(env, row, r) {
     const out = Object.values(kept).reduce((a, b) => a + b, 0);
     if (kept[1600]) await env.STORE.delete(row.key);   // the desktop size covers the original; the phone falls back to it
     await db.prepare("INSERT INTO img_seen (sha, stored_at) VALUES (?, ?) ON CONFLICT(sha) DO NOTHING").bind(sha, now()).run();
-    if (out) { await mark("done", { out, note: notes.join("; ") || null }); r.done++; r.before += buf.byteLength; r.after += kept[1600] ? out : buf.byteLength + out; }
+    if (out) {
+      const keptBytes = kept[1600] ? out : buf.byteLength + out;
+      await mark("done", { out, kept: keptBytes, note: notes.join("; ") || null }); r.done++; r.before += buf.byteLength; r.after += keptBytes;
+      // The sender's share has room again: its pictures waiting for room are due now, and the hub's next minute fetches what fits.
+      if (row.dom && keptBytes < buf.byteLength) await db.prepare("UPDATE img_queue SET next_at = ? WHERE state = 'pending' AND kind = 'over' AND dom = ? AND next_at > ?").bind(now(), row.dom, now()).run().catch(() => {});
+    }
     else { await mark("skipped", { note: notes.join("; ").slice(0, 200) || "nothing smaller" }); r.skipped++; }
   } catch (e) {
     const tries = (row.tries || 0) + 1;
@@ -110,7 +117,7 @@ export async function tick(env) {
   await db.prepare("UPDATE img_work SET tries = tries + 1, state = CASE WHEN tries + 1 >= ? THEN 'failed' ELSE 'pending' END, note = 'claim taken back: the run that had it ended without a word', done_at = CASE WHEN tries + 1 >= ? THEN ? ELSE NULL END, claimed_at = NULL WHERE state = 'working' AND claimed_at < ?")
     .bind(IMG.maxTries, IMG.maxTries, now(), new Date(Date.now() - IMG.staleMs).toISOString()).run();
   // Fewest tries first: a picture whose run was killed waits behind the ones never tried, so it cannot be claimed first by every tick.
-  const rows = (await db.prepare("SELECT key, bytes, tries FROM img_work WHERE state = 'pending' ORDER BY tries, at DESC LIMIT ?").bind(IMG.batch).all()).results || [];
+  const rows = (await db.prepare("SELECT key, bytes, tries, dom FROM img_work WHERE state = 'pending' ORDER BY tries, at DESC LIMIT ?").bind(IMG.batch).all()).results || [];
   for (const row of rows) {
     if (Date.now() - t0 > IMG.batchMs || bigDrops !== r.drops0) break;
     const token = now() + "#" + crypto.randomUUID().slice(0, 8);   // sorts by time; unique per claim

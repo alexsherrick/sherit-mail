@@ -54,7 +54,7 @@ const sha = (n) => n.toString(16).padStart(64, "0");
 async function setup() {
   const sq = buildDb(), STORE = r2(), env = { DB: d1(sq), STORE };
   const put = (n, buf, ct) => { const k = "img/" + sha(n); STORE.m.set(k, { buf: new Uint8Array(buf), ct }); sq.prepare("INSERT INTO img_work (key, bytes, ct, state, at) VALUES (?, ?, ?, 'pending', ?)").run(k, buf.length, ct, new Date(Date.now() - n * 1000).toISOString()); return k; };
-  return { sq, STORE, env, put, row: (k) => sq.prepare("SELECT state, tries, out_bytes, note FROM img_work WHERE key = ?").get(k) };
+  return { sq, STORE, env, put, row: (k) => sq.prepare("SELECT state, tries, out_bytes, kept, note FROM img_work WHERE key = ?").get(k) };
 }
 
 // 1. the pictures through one tick
@@ -82,6 +82,20 @@ async function setup() {
   check(seen >= 4, `every picture it handled is noted as stored (${seen} rows)`);
   const ev = s.sq.prepare("SELECT detail FROM events WHERE kind = 'img_shrink'").get();
   check(r.n === 6 && ev && /n=6 /.test(ev.detail), `the run is logged (${ev?.detail})`);
+  // What is kept, which its sender's share counts it at
+  check(s.row(kPhoto).kept === s.row(kPhoto).out_bytes && s.row(kWebp).kept === SMALLWEBP.length + s.row(kWebp).out_bytes && s.row(kBad).kept === null,
+    `each row records what is kept: both sizes once the original goes, the original and the phone size when it stays, nothing for a refusal (${s.row(kPhoto).kept}, ${s.row(kWebp).kept}, ${s.row(kBad).kept})`);
+}
+// 1b. the sender's pictures waiting for room are due once its share has some back
+{
+  const s = await setup();
+  const k = s.put(1, PHOTO, "image/jpeg"); s.sq.prepare("UPDATE img_work SET dom = 'shop.example' WHERE key = ?").run(k);
+  const later = new Date(Date.now() + 3600e3).toISOString(), q = s.sq.prepare("INSERT INTO img_queue (hk, url, state, kind, tries, next_at, at, dom, size) VALUES (?, ?, 'pending', 'over', 0, ?, ?, ?, ?)");
+  q.run(1, "https://img.shop.example/a.png", later, new Date().toISOString(), "shop.example", 4000000);
+  q.run(2, "https://img.other.example/b.png", later, new Date().toISOString(), "other.example", 4000000);
+  await W.tick(s.env);
+  const due = (hk) => Date.parse(s.sq.prepare("SELECT next_at FROM img_queue WHERE hk = ?").get(hk).next_at) <= Date.now() + 1000;
+  check(due(1) && !due(2), `shrinking a sender's picture makes that sender's waiting pictures due, not another's (${due(1)}, ${due(2)})`);
 }
 // 2. claims: two ticks at once take each picture once; a crashed run's claim is taken back after ten minutes
 {

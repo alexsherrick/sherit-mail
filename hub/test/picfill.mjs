@@ -142,6 +142,31 @@ try {
   await untilReady(A);
   const noted2 = (progress(A).pics || []).map((x) => x[0]);
   check(JSON.stringify(noted2) === JSON.stringify([late]), `the rebuild notes only the mail the hub did not have (${noted2.map((id) => id === late ? "late" : id === newer ? "newer" : id === recent ? "recent" : id)})`);
+
+  // ---------- 5. a fill leaves half of its sender's share, and comes after new mail's pictures ----------
+  // A backfill spent google.com's whole share in four minutes; the next morning's Google mail had 8 pictures withheld.
+  sq.prepare("DELETE FROM img_queue").run(); sq.prepare("DELETE FROM events WHERE kind = 'img_prefetch'").run();
+  g.floor = 0; await once(A);   // Gmail keeps the new cursor; the rebuild's noted mail is queued as a fill
+  const filled = rows().filter((r) => /\/late\//.test(r.url));
+  check(filled.length === 2 && sq.prepare("SELECT COUNT(*) n FROM img_queue WHERE fill = 1").get().n === 2, `the fill's pictures are queued marked as a fill (${filled.length} queued)`);
+  // shop.example has stored 130 of its 250 pictures today; one picture new mail is waiting for was queued for it a minute AFTER the fill's
+  sq.prepare("INSERT INTO events (at, kind, detail) VALUES (datetime('now'), 'img_prefetch', 'hub:x from=shop.example n=130 stored=130 had=0 failed=0 over=0 skipped=0 sized=0 bytes=5000 ms=1')").run();
+  const fresh = "https://img.shop.example/fresh/new.png";
+  await mod.prefetchImages(env, `<img src="${fresh}">`, "hub:fresh", { from: "news@shop.example", deadline: Date.now() - 1 });   // cut off: left for the cron
+  sq.prepare("UPDATE img_queue SET next_at = ? WHERE url LIKE '%/late/%'").run(new Date(Date.now() - 60e3).toISOString());   // the fill's are due first
+  check(sq.prepare("SELECT fill FROM img_queue WHERE url = ?").get(fresh)?.fill === 0, `new mail's picture left for the cron is not a fill`);
+  const d5 = await mod.drainImgQueue(env, { max: 1 });
+  check(d5.stored === 1 && !sq.prepare("SELECT 1 FROM img_queue WHERE url = ?").get(fresh), `with room for one, the drain takes new mail's picture before the older fill (${JSON.stringify(d5)})`);
+  const d6 = await mod.drainImgQueue(env);
+  const waiting = rows().filter((r) => /\/late\//.test(r.url));
+  check(d6.stored === 0 && d6.over === 2 && waiting.length === 2 && waiting.every((r) => r.state === "pending" && Date.parse(r.next_at) > Date.now() + 50 * 60e3), `past half of its sender's share the fill waits an hour (${JSON.stringify(d6)})`);
+  // new mail with the same picture makes it new mail's; nothing else in its row changes
+  const lateUrl = (waiting[0] || filled[0]).url;
+  await mod.prefetchImages(env, `<img src="${lateUrl}">`, "hub:late", { from: "news@shop.example", deadline: Date.now() - 1 });
+  check(sq.prepare("SELECT fill FROM img_queue WHERE url = ?").get(lateUrl)?.fill === 0, `new mail wanting a filled picture makes it new mail's (fill ${sq.prepare("SELECT fill FROM img_queue WHERE url = ?").get(lateUrl)?.fill})`);
+  sq.prepare("UPDATE img_queue SET next_at = ? WHERE url = ?").run(new Date(Date.now() - 1000).toISOString(), lateUrl);
+  const d7 = await mod.drainImgQueue(env);
+  check(d7.stored === 1 && !sq.prepare("SELECT 1 FROM img_queue WHERE url = ?").get(lateUrl), `and the drain keeps it inside the same share (${JSON.stringify(d7)})`);
 } finally { globalThis.fetch = realFetch; }
 console.log(fails.length ? `\n${fails.length} failed` : "\nall picture-fill checks passed");
 process.exit(fails.length ? 1 : 0);

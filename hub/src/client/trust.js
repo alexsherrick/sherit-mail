@@ -56,6 +56,37 @@ function trustedAuth(values) {
   }
   return null;
 }
+// Named after a company the user gets mail from, sent from a domain that has never written to the user: three
+// fakes in two days under one company's name, each from its own hijacked SendGrid account, every sender check passing. `m.known` is the hub's list of
+// the domains that have written (GET /api/senders/orgs), built by impostorKnownOf; without it nothing is said. The hub runs the same
+// functions on arrival and files such mail in Spam; test/impostor.mjs holds the two copies identical.
+const impostorRoot = trustRoot;
+const IMPOSTOR_PLAIN = new Set("team support alerts alert security secure notifications notification notify account accounts billing service services customer customers care help helpdesk info news newsletter membership member members official online noreply no reply donotreply mail email center centre department dept updates update verification verify fraud protection payments payment rewards inc llc corp hq us usa".split(" "));
+function impostorOf(name, addr, known) {
+  const a = String(addr || "").toLowerCase(), i = a.lastIndexOf("@"); if (i < 1 || !known) return null;
+  const org = impostorRoot(a.slice(i + 1)); if (!org || known.orgs.has(org)) return null;
+  const flat = a.replace(/[^a-z0-9]/g, "");
+  const shown = String(name || "").replace(/[^A-Za-z0-9]+/g, " ").trim().split(" ").filter(Boolean), words = shown.map((w) => w.toLowerCase());
+  if (words[0] === "the") { words.shift(); shown.shift(); }
+  for (let k = 1; k <= Math.min(3, words.length); k++) {
+    const cand = words.slice(0, k).join("");
+    if (cand.length < 3 || !words.slice(k).every((w) => IMPOSTOR_PLAIN.has(w))) continue;
+    if (flat.includes(cand)) return null;
+    const real = [...(known.byLabel.get(cand) || [])].filter((o) => o !== org).sort();
+    if (real.length) return { name: shown.slice(0, k).join(" "), real: real[0], org };
+  }
+  return null;
+}
+// The domains that have written to the user (known senders not blocked) and the user's own, each also under its name:
+// "northwind.com" under "northwind".
+function impostorKnownOf(orgList) {
+  const orgs = new Set(), byLabel = new Map();
+  for (const x of orgList || []) {
+    const o = impostorRoot(x); if (!o) continue; orgs.add(o);
+    const l = o.split(".")[0].replace(/[^a-z0-9]/g, ""); if (l.length >= 3) { if (!byLabel.has(l)) byLabel.set(l, new Set()); byLabel.get(l).add(o); }
+  }
+  return { orgs, byLabel };
+}
 // → null (nothing to say), or { level: "danger" | "warn", title, lines: [...], ageDomain, date }.
 function assessTrust(m) {
   if (!m || m.out) return null;
@@ -89,6 +120,14 @@ function assessTrust(m) {
     if (auth && auth.dmarc === "pass") out.lines.push(`The account itself is real (${auth.from || fromRoot} confirmed it was sent from it). That is what a hijacked account looks like.`);
     if (/undisclosed[- ]recipients/i.test(String(m.to || "")) || (!m.to && !m.cc)) out.lines.push("It was sent to undisclosed recipients — a mass mailing, not a personal invitation.");
     if (/(?:open|view|access)\b[^.]{0,40}\bon (?:a |your )?(?:computer|desktop|laptop|pc)\b|optimi[sz]ed for desktop/i.test(visible)) out.lines.push("It asks you to open it on a computer — the usual sign of a download aimed at a PC.");
+    return out;
+  }
+  const imp = m.known ? impostorOf(m.fromName, fromAddr, m.known) : null;
+  if (imp) {
+    out.level = "danger"; out.ageDomain = imp.org;
+    out.title = `Named ${imp.name}, but it wasn't sent by ${imp.name}.`;
+    out.lines.push(`It came from ${fromAddr}. Your mail from ${imp.name} comes from ${imp.real}.`);
+    out.lines.push(`Nobody at ${imp.org} has written to you before.`);
     return out;
   }
   // Only a failure against a domain that ASKED receivers to quarantine or reject failing mail: that is a forgery of a domain that
