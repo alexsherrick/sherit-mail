@@ -38,7 +38,8 @@ function r2() {
   return store;
 }
 // the Worker, with its.wasm import turned into a module compiled here
-const src = readFileSync(process.env.IMGWORK_SRC || HUB + "img/src/index.js", "utf8").replace('import SHRINK_WASM from "../wasm/shrink.wasm";', `const SHRINK_WASM = new WebAssembly.Module(${JSON.stringify("__WASM__")});`);
+const src = readFileSync(process.env.IMGWORK_SRC || HUB + "img/src/index.js", "utf8").replace('import SHRINK_WASM from "../wasm/shrink.wasm";', `const SHRINK_WASM = new WebAssembly.Module(${JSON.stringify("__WASM__")});`)
+  .replace('import { logoMark } from "./logomark.js";', "const logoMark = async () => null;");   // the logo fingerprint has its own test (logomark.mjs)
 const tmp = HUB + "test/_imgwork_worker.mjs";
 writeFileSync(tmp, src.replace(`new WebAssembly.Module("__WASM__")`, `new WebAssembly.Module((await import("node:fs")).readFileSync(${JSON.stringify(HUB + "img/wasm/shrink.wasm")}))`));
 const W = await import(tmp); unlinkSync(tmp);

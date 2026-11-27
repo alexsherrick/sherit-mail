@@ -21,10 +21,13 @@ const nameOf = (s) => { const v = String(s || ""), i = v.indexOf("<"); if (i >= 
 const toast = (m, ms = 2600, undo = null, label = "Undo") => { const t = $("#toast"); t.textContent = m; t.onclick = null; if (undo) { const b = document.createElement("button"); b.textContent = label; b.style.cssText = "margin-left:12px;padding:3px 10px;border-radius:6px;border:1px solid currentColor;background:transparent;color:inherit"; b.onclick = (e) => { e.stopPropagation(); t.style.display = "none"; undo(); }; t.appendChild(b); ms = 5000; } t.style.display = "block"; clearTimeout(toast._t); toast._t = setTimeout(() => (t.style.display = "none"), ms); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // In-app confirm: a toast with buttons (Enter = confirm, Esc = cancel); never a native dialog, which freezes the page. Resolves false after 30 s.
-function ask(message, { ok = "OK", cancel = "Cancel", danger = false } = {}) {
+// `alt` adds a third choice, which resolves "alt" (a send check's "Add Dana and send").
+function ask(message, { ok = "OK", cancel = "Cancel", danger = false, alt = "" } = {}) {
   return new Promise((resolve) => {
-    const el = $("#ask"); if (ask.pending) ask.pending(false); el.innerHTML = ""; const msg = document.createElement("div"); msg.className = "msg"; msg.textContent = message; el.appendChild(msg);
-    const row = document.createElement("div"); row.className = "btns"; const bc = document.createElement("button"); bc.textContent = cancel; const bo = document.createElement("button"); bo.textContent = ok; bo.className = danger ? "danger" : "primary"; row.append(bc, bo); el.appendChild(row);
+    const el = $("#ask"); if (ask.pending) ask.pending(false); el.innerHTML = ""; const msg = document.createElement("div"); msg.className = "msg"; msg.style.whiteSpace = "pre-line"; msg.textContent = message; el.appendChild(msg);
+    const row = document.createElement("div"); row.className = "btns"; const bc = document.createElement("button"); bc.textContent = cancel; const bo = document.createElement("button"); bo.textContent = ok; bo.className = danger ? "danger" : "primary"; row.append(bc);
+    if (alt) { const ba = document.createElement("button"); ba.textContent = alt; ba.dataset.alt = "1"; ba.onclick = () => finish("alt"); row.append(ba); }
+    row.append(bo); el.appendChild(row);
     const finish = (v) => { ask.pending = null; el.classList.remove("on"); document.removeEventListener("keydown", onKey, true); clearTimeout(tm); resolve(v); };
     const onKey = (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); } };
     bc.onclick = () => finish(false); bo.onclick = () => finish(true); ask.pending = finish; const tm = setTimeout(() => finish(false), 30000);
@@ -109,7 +112,7 @@ const SWIPE_COLORS = { archive: "var(--ok)", trash: "var(--danger)", spam: "var(
 const SWIPE_DEFAULTS = { left: "archive", leftLong: "trash", right: "snooze", rightLong: "block" }; // Spark-style: a short swipe and a long swipe per side
 const prefs = () => ((p) => { p.swipes = { ...SWIPE_DEFAULTS, ...(p.swipes || {}) }; return p; })({ swipes: { ...SWIPE_DEFAULTS }, showDupes: false, groupByDay: true, notify: "all", gatekeeper: "off", openInChrome: true, groupSenders: true, signatures: {}, setAside: [], knownSenders: [], catOverrides: {}, priorityThreads: [], keys: {}, snippets: [], splits: [], muted: [], mutedAt: {}, renames: {}, replyLater: [], ...(state.prefs || {}) });
 // Prefs come from the hub as free-form JSON; anything of the wrong shape falls back to its default so a bad value cannot break the UI.
-function normalizePrefs(p) { const out = { ...p }; for (const k of ["setAside", "knownSenders", "priorityThreads", "snippets", "splits", "muted", "replyLater", "acctOrder", "ownRows"]) if (!Array.isArray(out[k])) delete out[k]; if (out.ownRows) out.ownRows = out.ownRows.filter((x) => typeof x === "string").map((x) => x.toLowerCase()); for (const k of ["acctNames", "acctColors", "swipes", "signatures", "catOverrides", "keys", "mutedAt", "renames", "notifyByAccount"]) if (!out[k] || typeof out[k] !== "object" || Array.isArray(out[k])) delete out[k]; for (const k of ["notify", "gatekeeper", "compose"]) if (typeof out[k] !== "string") delete out[k]; for (const k of ["openInChrome", "groupByDay", "showDupes", "groupSenders", "splitDomains"]) if (out[k] !== undefined && typeof out[k] !== "boolean") delete out[k]; if (out.snippets) out.snippets = out.snippets.filter((s) => s && typeof s.name === "string" && typeof s.text === "string"); if (out.splits) out.splits = out.splits.filter((s) => s && typeof s.name === "string" && typeof s.query === "string"); if (out.keys) for (const [k, v] of Object.entries(out.keys)) if (typeof v !== "string" || v.length > 12) delete out.keys[k]; if (out.acctOrder) out.acctOrder = out.acctOrder.filter((x) => typeof x === "string"); if (out.acctNames) out.acctNames = Object.fromEntries(Object.entries(out.acctNames).filter(([, v]) => typeof v === "string" && v.trim()).map(([k, v]) => [k, v.trim().slice(0, 40)])); if (out.acctColors) out.acctColors = Object.fromEntries(Object.entries(out.acctColors).filter(([, v]) => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v)).map(([k, v]) => [k, v.toLowerCase()])); return out; }
+function normalizePrefs(p) { const out = { ...p }; for (const k of ["setAside", "knownSenders", "priorityThreads", "snippets", "splits", "muted", "replyLater", "acctOrder", "ownRows"]) if (!Array.isArray(out[k])) delete out[k]; if (out.ownRows) out.ownRows = out.ownRows.filter((x) => typeof x === "string").map((x) => x.toLowerCase()); for (const k of ["acctNames", "acctColors", "swipes", "signatures", "catOverrides", "keys", "mutedAt", "renames", "notifyByAccount", "followDone", "rsvp"]) if (!out[k] || typeof out[k] !== "object" || Array.isArray(out[k])) delete out[k]; for (const k of ["notify", "gatekeeper", "compose"]) if (typeof out[k] !== "string") delete out[k]; for (const k of ["openInChrome", "groupByDay", "showDupes", "groupSenders", "splitDomains", "followUps", "logos"]) if (out[k] !== undefined && typeof out[k] !== "boolean") delete out[k]; if (out.snippets) out.snippets = out.snippets.filter((s) => s && typeof s.name === "string" && typeof s.text === "string"); if (out.splits) out.splits = out.splits.filter((s) => s && typeof s.name === "string" && typeof s.query === "string"); if (out.keys) for (const [k, v] of Object.entries(out.keys)) if (typeof v !== "string" || v.length > 12) delete out.keys[k]; if (out.acctOrder) out.acctOrder = out.acctOrder.filter((x) => typeof x === "string"); if (out.acctNames) out.acctNames = Object.fromEntries(Object.entries(out.acctNames).filter(([, v]) => typeof v === "string" && v.trim()).map(([k, v]) => [k, v.trim().slice(0, 40)])); if (out.acctColors) out.acctColors = Object.fromEntries(Object.entries(out.acctColors).filter(([, v]) => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v)).map(([k, v]) => [k, v.toLowerCase()])); return out; }
 state.keep = new Set(); state.focus = null; state.lastChecked = null; state.bulkLog = [];
 const KEY_DEFAULTS = { next: "j", prev: "k", open: "Enter", archive: "e", trash: "#", star: "s", unread: "u", snooze: "h", reply: "r", replyall: "a", forward: "f", compose: "c", search: "/", select: "x", palette: "k", mute: "m", unsubscribe: "!", replylater: "l", aside: "g", back: "Escape", readnext: "n", selectall: "A", fromhere: "X" };
 const keyFor = (action) => (prefs().keys || {})[action] || KEY_DEFAULTS[action];
@@ -118,6 +121,43 @@ async function setPref(k, v) { state.prefs[k] = v; try { await api("/api/prefs",
 const catOf = (t) => { const r = senderRule(t.fromAddr, t.account); return (r && r.category) || t.cat; };
 const isPriority = (t) => senderRule(t.fromAddr, t.account)?.action === "priority" || prefs().priorityThreads.includes(t.key);
 const isNewSender = (t) => prefs().gatekeeper === "top" && viewBox() === "inbox" && !t.out && !!t.fromAddr && state.pendingSenders.has(t.fromAddr) && !senderRule(t.fromAddr, t.account) && !state.me.identities.some((i) => i.email === t.fromAddr) && !state.gmail.some((g) => g.email === t.fromAddr);
+// Follow-up suggestions, as Apple Mail's: "If you send a message and don't receive a response in 3 days, the sent
+// email automatically resurfaces to the top of your inbox to help you remember to follow up." Only mail that asks for something (a
+// question, "let me know", "can you"...) of someone else, never a no-reply address or yourself; three to fourteen days old; Done sets it
+// aside until you write in that conversation again (followDone holds the message it was dismissed at). Apple's users found theirs
+// raising mail that wanted no answer, so a thank-you or "sounds good" is never raised, nor a "please go to Settings" answering someone
+// (a bare "please" raised that one in the user's own Sent: four of thirteen raised then, each one waiting on an answer).
+const FOLLOW = { afterMs: 3 * 864e5, untilMs: 14 * 864e5 };
+const FOLLOW_NOREPLY = /^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounces?)([+._-][^@]*)?@/i;
+const FOLLOW_ASKS = /\?|\b(let me know|lmk|can you|could you|would you|will you|can we|could we|please (?:advise|confirm|send|reply|respond|review|cancel|call|check|update|share|let)|thoughts|any update|get back to me|let us know|look(ing)? forward to hearing)\b/i;
+const FOLLOW_CLOSER = /^\s*(thanks|thank you|thx|ty|cheers|sounds good|great|perfect|awesome|will do|ok(ay)?|got it|cool|no worries|appreciate it|congrats)\b[^?]{0,40}$/i;
+// a snippet runs on into the message quoted under it; only the words above that are yours
+const ownWords = (s) => String(s || "").split(/\bOn\b[^\n]{0,160}?\bwrote:|-{3,}\s*(?:Original|Forwarded) Message|\n>|\bFrom:\s/i)[0];
+const addrsIn = (s) => (String(s || "").match(/[^\s<>,;"'()]+@[^\s<>,;"'()]+\.[^\s<>,;"'()]+/g) || []).map(lc);
+function isFollowUp(t, now = Date.now()) {
+  if (!t || !t.out || t.state === "trash" || t.state === "spam" || t.state === "snoozed" || isHubCopy(t)) return false;
+  const p = prefs(); if (p.followUps === false) return false;
+  const age = now - (t.date || 0); if (age < FOLLOW.afterMs || age > FOLLOW.untilMs) return false;
+  if (Object.prototype.hasOwnProperty.call(p.followDone || {}, t.key) && p.followDone[t.key] === String(t.lastMsgId || "")) return false;
+  if ((p.muted || []).includes(t.key) || (p.setAside || []).includes(t.key)) return false;
+  if (!addrsIn(t.to).some((a) => !isMine(a) && !FOLLOW_NOREPLY.test(a))) return false;
+  const own = ownWords(t.snippet).trim(); return FOLLOW_ASKS.test(own) && !FOLLOW_CLOSER.test(own);
+}
+// The conversations the inbox raises now, newest first, for the view on screen (its account, its domain chip).
+function followUps() {
+  const v = state.view; if (state.search || !["inbox", "personal"].includes(v.kind)) return [];
+  const now = Date.now(), out = [];
+  for (const t of state.threads.values()) if (t.out && isFollowUp(t, now) && (!v.account || inAccount(t, v.account)) && (!v.dom || domainOf(t.identity) === v.dom)) out.push(t);
+  return out.sort((a, b) => b.date - a.date);
+}
+async function followDone(keys) {
+  const now = Date.now(), done = {};
+  // what can still be raised: a conversation this device does not hold is kept (another device may), the oldest dropped past 300
+  for (const [k, id] of Object.entries(prefs().followDone || {})) { const t = state.threads.get(k); if (!t || now - (t.date || 0) <= FOLLOW.untilMs + 864e5) done[k] = id; }
+  for (const k of Object.keys(done).slice(0, Math.max(0, Object.keys(done).length - 300 + keys.length))) delete done[k];
+  for (const k of keys) { const t = state.threads.get(k); if (t) done[k] = String(t.lastMsgId || ""); }
+  await setPref("followDone", done);
+}
 let expanded = new Set();
 // An IMAP mailbox with no password is CONFIGURED, not CONNECTED; my call: a mailbox that is not wired up yet should not
 // be shown; the functionality should work, but nothing needs to watch it. Until it has credentials it must not own
@@ -262,7 +302,7 @@ const hub = {
     const uh = (() => { try { return typeof t.unsub === "string" ? JSON.parse(t.unsub) : (t.unsub || {}); } catch (_) { return {}; } })(); // newest inbound List-Unsubscribe of the thread (server column)
     const from = out ? l.identity : (l.from_name ? `${l.from_name} <${l.from_addr}>` : l.from_addr);
     const to = (() => { try { return JSON.parse(l.to_addrs || "[]").map((a) => a.address).join(", "); } catch (_) { return ""; } })();
-    return { key: `hub|${t.id}`, account: "hub", kind: "hub", id: t.id, msgIds: (t.msg_ids || []).map((x) => String(x).replace(/^<|>$/g, "")), subject: l.subject || "(no subject)", snippet: l.snippet || "", from, fromAddr: out ? l.identity : lc(l.from_addr), fromName: out ? "You" : (l.from_name || nameOf(l.from_addr)), to, identity: l.identity || "", out, date: Date.parse(l.created_at || t.last_message_at) || 0, unread: !!t.unread, starred: !!t.starred, state: t.state, labels, cat: t.category || categorize({ from: l.from_addr || "" }), count: t.message_count || 1, lastMsgId: l.id, unsub: uh.list_unsubscribe || (!out && l.list_unsubscribe) || "", unsubPost: uh.list_unsubscribe_post || (!out && l.list_unsubscribe_post) || "", unsubKnown: true, msgIdHdr: (l.message_id || "").replace(/^<|>$/g, ""), hasAtt: !!t.has_att, sentOnly: t.has_in === 0, hasOut: t.has_out === 1 };
+    return { key: `hub|${t.id}`, account: "hub", kind: "hub", id: t.id, msgIds: (t.msg_ids || []).map((x) => String(x).replace(/^<|>$/g, "")), subject: l.subject || "(no subject)", snippet: l.snippet || "", from, fromAddr: out ? l.identity : lc(l.from_addr), fromName: out ? "You" : (l.from_name || nameOf(l.from_addr)), to, identity: l.identity || "", out, date: Date.parse(l.created_at || t.last_message_at) || 0, unread: !!t.unread, starred: !!t.starred, state: t.state, labels, cat: t.category || categorize({ from: l.from_addr || "" }), count: t.message_count || 1, lastMsgId: l.id, unsub: uh.list_unsubscribe || (!out && l.list_unsubscribe) || "", unsubPost: uh.list_unsubscribe_post || (!out && l.list_unsubscribe_post) || "", unsubKnown: true, msgIdHdr: (l.message_id || "").replace(/^<|>$/g, ""), hasAtt: !!t.has_att, sentOnly: t.has_in === 0, hasOut: t.has_out === 1, proven: !out && l.proven === 1 };
   },
   async list(box, q) { const d = await api(`/api/threads?limit=200&box=${box}${q ? "&q=" + encodeURIComponent(q) : ""}`); const rows = d.threads.map((t) => this.norm(t)); state.pageTokens[`hub|${box}|${q || ""}`] = rows.length >= 200 ? { before: d.threads[d.threads.length - 1].last_message_at } : null; return rows; },
   async more(box, q) { const k = `hub|${box}|${q || ""}`; const pt = state.pageTokens[k]; if (!pt) return []; const d = await api(`/api/threads?limit=200&box=${box}&before=${encodeURIComponent(pt.before)}${q ? "&q=" + encodeURIComponent(q) : ""}`); state.pageTokens[k] = d.threads.length >= 200 ? { before: d.threads[d.threads.length - 1].last_message_at } : null; return d.threads.map((t) => this.norm(t)); },
@@ -299,7 +339,7 @@ async function gapi(email, path, o = {}) {
 const hv = (m, n) => (((m || {}).payload || {}).headers || []).find((x) => lc(x.name) === lc(n))?.value || "";
 const hmap = (m) => { const o = {}; for (const h of ((m || {}).payload || {}).headers || []) o[lc(h.name)] = h.value; return o; };
 function gmailAdapter(email) {
-  const META = "format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post&metadataHeaders=List-Id&metadataHeaders=Precedence&metadataHeaders=Auto-Submitted&metadataHeaders=Message-ID";
+  const META = "format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post&metadataHeaders=List-Id&metadataHeaders=Precedence&metadataHeaders=Auto-Submitted&metadataHeaders=Message-ID&metadataHeaders=Authentication-Results";
   const self = {
     id: email, kind: "gmail",
     norm(th) {
@@ -309,7 +349,8 @@ function gmailAdapter(email) {
       const unsubMsg = [...msgs].reverse().find((m) => !(m.labelIds || []).includes("SENT") && hv(m, "List-Unsubscribe")) || null; // newest inbound message that carries List-Unsubscribe
       const from = hv(lastIn, "From") || hv(last, "From"); const out = (last.labelIds || []).includes("SENT");
       const st = labels.has("TRASH") ? "trash" : labels.has("SPAM") ? "spam" : (labels.has("INBOX") ? "inbox" : (state.snoozedGmail.has(`${email}|${th.id}`) ? "snoozed" : "archived"));   // as deriveGmailThread (store.js): a server-search row from in:spam was "archived"
-      return { key: `${email}|${th.id}`, account: email, kind: "gmail", id: th.id, subject: hv(first, "Subject") || hv(last, "Subject") || "(no subject)", snippet: gmailSnippet(last.snippet), from, fromAddr: addrOf(from), fromName: out ? "You" : nameOf(from), to: hv(last, "To"), identity: email, out, date: Number(last.internalDate) || Date.parse(hv(last, "Date")) || 0, unread: labels.has("UNREAD"), starred: labels.has("STARRED"), state: st, labels: [...labels], cat: categorize({ headers: hmap(lastIn), from, labels: [...labels] }), count: msgs.length, shownIds: msgs.length < every.length ? msgs.map((m) => m.id) : null, binnedIds: trashedIds(every, msgs, (m) => m.labelIds), lastMsgId: last.id, msgIdHdr: (hv(last, "Message-ID") || "").replace(/^<|>$/g, ""), msgIds: every.map((m) => (hv(m, "Message-ID") || "").replace(/^<|>$/g, "")), hasAtt: false, unsub: unsubMsg ? hv(unsubMsg, "List-Unsubscribe") : "", unsubPost: unsubMsg ? hv(unsubMsg, "List-Unsubscribe-Post") : "", unsubKnown: true };
+      const proven = provenBy(((lastIn.payload || {}).headers || []).filter((h) => lc(h.name) === "authentication-results").map((h) => h.value), "mx.google.com", addrOf(hv(lastIn, "From")));
+      return { key: `${email}|${th.id}`, account: email, kind: "gmail", id: th.id, proven, proofKnown: true, subject: hv(first, "Subject") || hv(last, "Subject") || "(no subject)", snippet: gmailSnippet(last.snippet), from, fromAddr: addrOf(from), fromName: out ? "You" : nameOf(from), to: hv(last, "To"), identity: email, out, date: Number(last.internalDate) || Date.parse(hv(last, "Date")) || 0, unread: labels.has("UNREAD"), starred: labels.has("STARRED"), state: st, labels: [...labels], cat: categorize({ headers: hmap(lastIn), from, labels: [...labels] }), count: msgs.length, shownIds: msgs.length < every.length ? msgs.map((m) => m.id) : null, binnedIds: trashedIds(every, msgs, (m) => m.labelIds), lastMsgId: last.id, msgIdHdr: (hv(last, "Message-ID") || "").replace(/^<|>$/g, ""), msgIds: every.map((m) => (hv(m, "Message-ID") || "").replace(/^<|>$/g, "")), hasAtt: false, unsub: unsubMsg ? hv(unsubMsg, "List-Unsubscribe") : "", unsubPost: unsubMsg ? hv(unsubMsg, "List-Unsubscribe-Post") : "", unsubKnown: true };
     },
     async fetchThreads(ids) { const out = []; const batch = 8; for (let i = 0; i < ids.length; i += batch) out.push(...await Promise.all(ids.slice(i, i + batch).map((id) => gapi(email, `threads/${id}?${META}`).catch(() => null)))); return out.filter(Boolean).map((t) => this.norm(t)); },
     async list(box, q) {
@@ -344,8 +385,9 @@ function gmailAdapter(email) {
         // `url` is what proxyImages() needs to resolve a `cid:` reference; the hub adapter has always supplied one and this did not, so
         // every inline image in Gmail mail rendered with an empty src. Served same-origin because the frame's CSP is `img-src 'self' data:`.
         const attachments = parts.filter((p) => p.filename && p.body?.attachmentId).map((p) => ({ id: p.body.attachmentId, name: p.filename, size: p.body.size, cid: (p.headers || []).find((h) => lc(h.name) === "content-id")?.value, mime: p.mimeType, msgId: m.id, url: `/api/gmail/att/${encodeURIComponent(email)}/${m.id}/${p.body.attachmentId}?mime=${encodeURIComponent(p.mimeType || "")}` }));
+        const calPart = parts.find((p) => /^(text\/calendar|application\/ics)/i.test(p.mimeType || "")), calendar = calPart ? (calPart.body?.data ? { data: dec(calPart) } : calPart.body?.attachmentId ? { attId: calPart.body.attachmentId, msgId: m.id } : null) : null;   // an invitation
         const from = hv(m, "From"); const out = (m.labelIds || []).includes("SENT");
-        return { id: m.id, authResults: ((m.payload || {}).headers || []).filter((x) => lc(x.name) === "authentication-results").map((x) => x.value), from: out ? from || email : from, fromAddr: out ? email : addrOf(from), to: hv(m, "To"), cc: hv(m, "Cc"), date: Number(m.internalDate) || 0, subject: hv(m, "Subject"), text, html: html || (m.payload?.mimeType === "text/html" && m.payload?.body?.data ? b64u.decToStr(m.payload.body.data) : ""), out, identity: email, replyTo: hv(m, "Reply-To"), attachments, msgIdHdr: (hv(m, "Message-ID") || "").replace(/^<|>$/g, ""), refs: hv(m, "References"), inReplyTo: hv(m, "In-Reply-To"), labels: m.labelIds || [], threadId: th.id, unsub: hv(m, "List-Unsubscribe"), unsubPost: hv(m, "List-Unsubscribe-Post") };
+        return { id: m.id, calendar, authResults: ((m.payload || {}).headers || []).filter((x) => lc(x.name) === "authentication-results").map((x) => x.value), from: out ? from || email : from, fromAddr: out ? email : addrOf(from), to: hv(m, "To"), cc: hv(m, "Cc"), date: Number(m.internalDate) || 0, subject: hv(m, "Subject"), text, html: html || (m.payload?.mimeType === "text/html" && m.payload?.body?.data ? b64u.decToStr(m.payload.body.data) : ""), out, identity: email, replyTo: hv(m, "Reply-To"), attachments, msgIdHdr: (hv(m, "Message-ID") || "").replace(/^<|>$/g, ""), refs: hv(m, "References"), inReplyTo: hv(m, "In-Reply-To"), labels: m.labelIds || [], threadId: th.id, unsub: hv(m, "List-Unsubscribe"), unsubPost: hv(m, "List-Unsubscribe-Post") };
       });
       return { thread: { id: th.id }, messages, ...(lens ? { binnedView: true, others: live.length } : {}) };
     },
@@ -413,7 +455,8 @@ function buildMime(d) {
   if (d.inReplyTo) hdr.push(`In-Reply-To: <${d.inReplyTo}>`); if (d.references) hdr.push(`References: ${d.references}`);
   const plainPart = `Content-Type: text/plain; charset=UTF-8${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(d.text || "").replace(/(.{76})/g, "$1" + nl)}`;
   const altB = "=_alt_" + Math.random().toString(36).slice(2);
-  const textPart = d.html ? `Content-Type: multipart/alternative; boundary="${altB}"${nl}${nl}--${altB}${nl}${plainPart}${nl}--${altB}${nl}Content-Type: text/html; charset=UTF-8${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(d.html).replace(/(.{76})/g, "$1" + nl)}${nl}--${altB}--${nl}` : plainPart;
+  const calMethod = d.calendar && /^[A-Z]{3,12}$/.test(d.calendar.method || "") ? d.calendar.method : null;   // an invitation's answer, as Outlook and Google send theirs
+  const textPart = calMethod ? `Content-Type: multipart/alternative; boundary="${altB}"${nl}${nl}--${altB}${nl}${plainPart}${nl}--${altB}${nl}Content-Type: text/calendar; charset=UTF-8; method=${calMethod}${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(String(d.calendar.ics || "")).replace(/(.{76})/g, "$1" + nl)}${nl}--${altB}--${nl}` : d.html ? `Content-Type: multipart/alternative; boundary="${altB}"${nl}${nl}--${altB}${nl}${plainPart}${nl}--${altB}${nl}Content-Type: text/html; charset=UTF-8${nl}Content-Transfer-Encoding: base64${nl}${nl}${utf8b64(d.html).replace(/(.{76})/g, "$1" + nl)}${nl}--${altB}--${nl}` : plainPart;
   // Inline pictures (a forward's) go beside the HTML that names them, in a multipart/related, under their Content-ID.
   const inl = d.html ? (d.attachments || []).filter((a) => a.disposition === "inline" && a.contentId) : [], files = (d.attachments || []).filter((a) => !inl.includes(a));
   let core = textPart;
@@ -1016,7 +1059,7 @@ function renderChips() {
     $$("#chips [data-scope]").forEach((b) => b.onclick = () => searchScope(b.dataset.scope)); $("[data-savesplit]").onclick = () => saveSplit(state.search); $("[data-clearsearch]").onclick = () => clearSearch(); allAcct(); return;
   }
   if (state.view.kind === "replylater") { const n = prefs().replyLater.filter((k) => state.threads.has(k)).length; $("#chips").innerHTML = acct + `<span class="badge">${n} waiting</span><span style="flex:1"></span><button data-focus="1" class="primary" ${n ? "" : "disabled"}>Focus &amp; Reply</button>`; $("[data-focus]").onclick = () => focusReply(0); allAcct(); return; }
-  const shown = () => visibleThreads().filter((t) => !isNewSender(t));
+  const shown = () => visibleThreads().filter((t) => !inTopBox(t));
   if (inUnread()) {
     const n = shown().length; const cats = [[null, "All"], ...Object.entries(CATS)];
     $("#chips").innerHTML = acct + cats.map(([k, l]) => `<button class="${(v.cat || null) === k ? "on" : ""}" data-ucat="${k || ""}">${l}</button>`).join("") + `<span class="badge" title="Unread mail in every inbox, however old, and unread mail outside the inbox from the last ${SYNC.windowDays} days">${n} unread</span><span style="flex:1"></span><button data-blanket="done" ${n ? "" : "disabled"} title="Done + read for everything shown">${ico("done")}Done all</button><button data-blanket="read" ${n ? "" : "disabled"}>Read all</button><button data-blanket="trash" ${n ? "" : "disabled"}>${ico("trash")}Trash all</button>`;
@@ -1066,6 +1109,25 @@ function syncRowEstimate(el) {
   const cs = getComputedStyle(row); const h = row.getBoundingClientRect().height - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - parseFloat(cs.borderTopWidth) - parseFloat(cs.borderBottomWidth);
   const v = Math.round(h * 100) / 100 + "px"; if (h > 0 && el.style.getPropertyValue("--rowh") !== v) { el.style.setProperty("--rowh", v); return true; } return false;
 }
+// A row in a box above the list (New senders, Follow up) is not one of the list's own rows for j/k, selection or dragging.
+const inTopBox = (t) => isNewSender(t) || !!(render.follow && render.follow.has(t.key));
+// the name the To header gives an address: "Smith, Dana" <dana@…> (quoted, commas and all) or Dana Smith <dana@…>; else its own name
+const toName = (t, a) => { const to = String(t.to || ""), at = a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); const m = to.match(new RegExp(`"([^"]*)"\\s*<${at}>`, "i")) || to.match(new RegExp(`(?:^|,)\\s*([^",<]+?)\\s*<${at}>`, "i")); return (m && m[1].trim()) || nameOf(a); };
+function followBox(fu) {
+  const box = document.createElement("div"); box.className = "fubox"; box.style.cssText = "border-bottom:2px solid var(--line);background:var(--card)";
+  const now = Date.now();
+  box.innerHTML = `<div class="day" style="background:transparent;display:flex;align-items:center;gap:8px">Follow up <span class="badge">${fu.length}</span><span style="flex:1"></span>${fu.length > 1 ? `<button data-fu="doneall" style="padding:2px 8px;font-size:12px">Done with all</button>` : ""}</div>`
+    + fu.map((t) => { const others = addrsIn(t.to).filter((a) => !isMine(a)); const who = others[0] || t.to || ""; const name = unbidi(toName(t, who)); const days = Math.max(3, Math.floor((now - t.date) / 864e5));
+      return `<div class="t" data-key="${esc(t.key)}"><div ${tileAttrs(t, who)}>${esc((name[0] || "?").toUpperCase())}</div><div class="who"><span style="overflow:hidden;text-overflow:ellipsis">To ${esc(name)}${others.length > 1 ? ` +${others.length - 1}` : ""}</span></div><div class="when"><span class="tm">${when(t.date)}</span></div><div class="sub">${esc(t.subject)}</div><div class="snip" style="display:flex;gap:6px;flex-wrap:wrap;white-space:normal;align-items:center"><span style="color:var(--mut)">No reply in ${days} days</span><span style="flex:1"></span><button data-fu="reply" data-key="${esc(t.key)}" style="padding:3px 9px;font-size:12px">${ico("replyall")}Follow up</button><button data-fu="done" data-key="${esc(t.key)}" class="ghost" style="padding:3px 9px;font-size:12px" title="Stop suggesting this one">${ico("done")}Done</button></div></div>`; }).join("");
+  box.querySelectorAll(".t").forEach((d) => d.onclick = (e) => { if (e.target.closest("button")) return; openThread(d.dataset.key); });
+  box.querySelectorAll("[data-fu]").forEach((b) => b.onclick = async (e) => {
+    e.stopPropagation(); const k = b.dataset.fu;
+    if (k === "reply") { await openThread(b.dataset.key); openReplySheet({ all: true }); return; }
+    const keys = k === "doneall" ? fu.map((t) => t.key) : [b.dataset.key];
+    await followDone(keys); render(); toast(keys.length > 1 ? `${keys.length} set aside until you write in them again` : "Set aside until you write in it again");
+  });
+  return box;
+}
 function render() {
   if (state.view.kind === "drafts" && !state.search) return renderDrafts();   // its own list; a search shows its results
   renderGen++; for (const r of [...activeGestures]) { try { r(false); } catch (_) {} } activeGestures.clear();
@@ -1096,7 +1158,8 @@ function render() {
   // A different list (view, account, category, search) is still built from scratch.
   const reuse = keepTop !== null && rows.length > 0 && state.view.kind !== "feed";
   if (!reuse) el.innerHTML = "";
-  if (!rows.length) { el.innerHTML = `<div class="empty">${state.loading ? "Loading…" : "Nothing here"}</div>`; const n = leftOutNote(); if (n) el.appendChild(n); return; }
+  const fu = followUps(); render.follow = new Set(fu.map((t) => t.key));   // raised above the inbox, so not in it
+  if (!rows.length && !fu.length) { el.innerHTML = `<div class="empty">${state.loading ? "Loading…" : "Nothing here"}</div>`; const n = leftOutNote(); if (n) el.appendChild(n); return; }
   const oldRows = new Map(), oldDays = new Map();
   if (reuse) for (const d of el.children) { if (d.dataset.key && d._html) oldRows.set(d.dataset.key, d); else if (d.className === "day") { const a = oldDays.get(d.textContent) || []; a.push(d); oldDays.set(d.textContent, a); } }
   let lastDay = ""; const p = prefs(); const want = [];
@@ -1110,8 +1173,9 @@ function render() {
     box.querySelectorAll("[data-gk]").forEach((b) => b.onclick = async (e) => { e.stopPropagation(); const k = b.dataset.gk; if (k.endsWith("dom")) { const t = state.threads.get(b.dataset.key); if (!t) return; return domainRule(t.fromAddr.split("@")[1], k === "acceptdom" ? "accept" : "block", t.account); } const targets = k.endsWith("all") ? fresh : [state.threads.get(b.dataset.key)].filter(Boolean); if (k.startsWith("accept")) { const addrs = [...new Set(targets.map((t) => t.fromAddr))]; await api("/api/senders", { method: "POST", body: JSON.stringify({ addresses: addrs, status: "accepted" }) }); addrs.forEach((x) => state.pendingSenders.delete(x)); for (const t of targets) { const r = senderRule(t.fromAddr, t.account); if (r && r.action === "block" && lc(r.pattern).startsWith("*@")) { try { const rr = await api("/api/sender-rules", { method: "POST", body: JSON.stringify({ pattern: t.fromAddr, action: "accept" }) }); state.rules.push(rr.rule); } catch (_) {} } } toast(`Accepted ${targets.length}`); render(); } else { if (!(await ask(`Block ${targets.length} sender(s)? Their mail goes to trash in every account.`, { ok: "Block", danger: true }))) return; for (const t of targets) await act(t, "block", { quiet: true }); toast(`Blocked ${targets.length}`); } });
     want.push(box);
   }
+  if (fu.length) want.push(followBox(fu));
   if (state.view.kind === "feed") { renderFeed(rows, el); restoreTop(); return; }
-  const mainAll = rows.filter((t) => !isNewSender(t)); render.mainAll = mainAll;
+  const mainAll = rows.filter((t) => !inTopBox(t)); render.mainAll = mainAll;
   const main = mainAll.slice(0, Math.max(RENDER_CHUNK, keepRows)); render.mainCursor = main.length;   // a rebuild of the same list keeps every row already scrolled into, or the offset is clamped back
   // Group by sender for Notifications / Newsletters (one line per sender, expandable)
   const grouped = new Map(); const groupable = p.groupSenders && (CATS[state.view.kind] ? state.view.kind !== "personal" : false);
@@ -1129,7 +1193,7 @@ function render() {
       if (seenGroup.has(t.fromAddr)) { if (!expanded.has(t.fromAddr)) continue; } else {
         seenGroup.add(t.fromAddr); const g = grouped.get(t.fromAddr); const open = expanded.has(t.fromAddr);
         const gd = document.createElement("div"); gd.className = "t grp" + (g.some((x) => x.unread) ? " unread" : "");   // grey only when something in it is unread, like any row
-        gd.innerHTML = `<div ${tileAttrs(t, t.fromAddr)}>${esc((unbidi(t.fromName)[0] || "?").toUpperCase())}</div><div class="who"><span style="overflow:hidden;text-overflow:ellipsis">${esc(unbidi(t.fromName || t.fromAddr))}</span><span class="badge">${g.length}</span></div><div class="when"><span class="tm">${when(t.date)}</span></div><div class="sub">${open ? "▾" : "▸"} ${esc(g.filter((x) => x.unread).length)} unread · <bdi>${esc(String(t.subject || "").replace(BIDI_CTRL, ""))}</bdi></div><div class="quick"><button data-g="archive" title="Done all from this sender">✓ all</button><button data-g="read" title="Read all">read</button></div>`;
+        gd.innerHTML = `<div ${tileAttrs(t, t.fromAddr)}>${esc((unbidi(t.fromName)[0] || "?").toUpperCase())}${isBiz(t) && logoShown(t) ? logoImg(t.fromAddr) : ""}</div><div class="who"><span style="overflow:hidden;text-overflow:ellipsis">${esc(unbidi(t.fromName || t.fromAddr))}</span><span class="badge">${g.length}</span></div><div class="when"><span class="tm">${when(t.date)}</span></div><div class="sub">${open ? "▾" : "▸"} ${esc(g.filter((x) => x.unread).length)} unread · <bdi>${esc(String(t.subject || "").replace(BIDI_CTRL, ""))}</bdi></div><div class="quick"><button data-g="archive" title="Done all from this sender">✓ all</button><button data-g="read" title="Read all">read</button></div>`;
         gd.onclick = () => { if (expanded.has(t.fromAddr)) expanded.delete(t.fromAddr); else expanded.add(t.fromAddr); render(); };
         gd.querySelectorAll("[data-g]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); bulk(b.dataset.g, g); });   // with Undo and the bulk log
         want.push(gd); if (!open) continue;
@@ -1218,6 +1282,59 @@ const SEARCH_TAG = { archived: "Archive", trash: "Trash", spam: "Spam", snoozed:
 // the pin and the paperclip moved to the end of the subject line for the same reason.
 const isBiz = (t) => !!t && !t.out && ["notifications", "newsletters"].includes(catOf(t));
 const tileAttrs = (t, key) => `class="av${isBiz(t) ? " biz" : ""}" style="--h:${hueFor(key)}"`;
+// Sender logos: a business sender's logo over its letter, from the hub, which finds it once per domain and keeps it
+// (index.js ensureLogo: only a domain that enforces DMARC); the sender never sees the app ask. A domain with none drops back to its
+// letter, and is not asked again this session.
+const LOGO_FREE = new Set(["gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me", "protonmail.com", "pm.me", "gmx.com", "gmx.net", "mail.com", "yandex.com", "zoho.com", "fastmail.com", "hey.com", "comcast.net", "att.net", "verizon.net"]);
+const LOGO_SLD2 = new Set(["co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp", "ne.jp", "co.kr", "com.br", "com.mx", "com.ar", "co.in", "co.za", "com.sg", "com.hk", "com.tw", "com.cn", "com.tr", "co.il", "com.my", "com.ph", "co.id", "com.co", "com.pe", "com.vn"]);
+const logoDomain = (addr) => { const p = domainOf(addr).split(".").filter(Boolean); if (p.length < 2) return ""; const two = p.slice(-2).join("."); const d = LOGO_SLD2.has(two) && p.length >= 3 ? p.slice(-3).join(".") : two; return LOGO_FREE.has(d) ? "" : d; };
+// A miss is kept five minutes, not the session: a domain the hub was still looking up answers 404 for five minutes, and
+// the app, open for days, kept showing the letter after the hub had found the logo. A domain with none is answered from the browser's
+// cache (a day), so asking again costs nothing.
+const logoMiss = new Map(), LOGO_RETRY_MS = 300e3;
+// Shown on a business sender's FIRST mail, with no wait: an earlier 7-day wait kept a new company's genuine first mail a letter.
+// It shows when all of these hold:
+//  - the mail is proven to come from its domain: DMARC passed in Gmail's or Cloudflare's own stamp, so a spoofed From never carries it;
+//  - it is not in Spam or Trash, and not an impostor;
+//  - its sender's name is not a protected brand's while its domain is another's (logoNameVeto): a gym chain's name on mail from an unrelated domain;
+//  - its picture is not a protected brand's while the sender is a stranger (the hub answers 404: index.js logoCopyOf).
+// The receiver's own DMARC clause, read as the hub reads it (index.js arClauses, dmarcClause, dmarcPassFor): split on ";" outside quotes
+// and comments, exactly one dmarc clause, and its header.from the From's own domain. Matching "dmarc=pass" anywhere took it from an
+// envelope sender written as `dmarc=pass@attacker.example`.
+function arClausesC(stamp) {
+  const s = String(stamp || ""), out = []; let cur = "", depth = 0, q = false;
+  for (let i = 0; i < s.length; i++) { const c = s[i];
+    if (q) { cur += c; if (c === "\\") cur += s[++i] ?? ""; else if (c === '"') q = false; continue; }
+    if (c === '"') q = true; else if (c === "(") depth++; else if (c === ")" && depth) depth--; else if (c === ";" && !depth) { out.push(cur.trim()); cur = ""; continue; }
+    cur += c; }
+  out.push(cur.trim()); return out;
+}
+// header.from may name the From's parent: Gmail writes the domain whose policy it applied, so news@emails.shop.example passes with
+// header.from=shop.example (measured in November 2026 on three retailers' real mail). DMARC passed for that parent, so the mail aligned with
+// it, and the logo is the parent's (logoDomain). A sibling or a look-alike (evilshop.example) never matches.
+function provenBy(values, server, addr) {
+  const stamp = [].concat(values || []).map((v) => String(v || "").replace(/\s+/g, " ").trim().toLowerCase()).find((v) => v.startsWith(server + ";"));   // the topmost: the receiver writes its own above any a sender wrote
+  const d = stamp ? arClausesC(stamp).filter((c) => /^dmarc=/.test(c)) : [], dom = domainOf(addr);
+  const hf = d.length === 1 ? ((/(?:^|\s)header\.from=([^\s;]+)/.exec(d[0]) || [])[1] || "") : "";
+  return /^dmarc=pass\b/.test(d[0] || "") && !!dom && hf.includes(".") && (hf === dom || dom.endsWith("." + hf));
+}
+// The borrowed-name check: a sender named after a protected brand (the domains that have written to the user, and the top sites the
+// hub lists as `brands`) from a domain that is not that brand's and does not carry its name. The impostor rule (trust.js impostorOf)
+// without its "has written before" exemption: a company's mail service sending under the company's name (Uber Eats from uber.com,
+// a shop through shopifyemail.com) shows its letter, since the logo there would be the service's. Replayed over 4,968 stored
+// messages: every fake named after a brand was refused, the ones in Spam among them; 4 of 651 business domains refused were a genuine
+// company's own other domain. Until the list has come, no logo (it comes with the impostor banner's, at boot).
+const LOGO_NO_ORGS = new Set();
+const logoNameVeto = (t) => { const p = state.logoProtect; if (!p) return true; try { return !!impostorOf(unbidi(t.fromName || ""), unbidi(t.fromAddr || ""), { orgs: LOGO_NO_ORGS, byLabel: p.byLabel }); } catch (_) { return true; } };
+const logoShown = (t) => !!t && t.proven === true && t.state !== "spam" && t.state !== "trash" && !(t.labels || []).some((x) => x === "SPAM" || x === "impostor") && !logoNameVeto(t);
+function logoImg(addr) {
+  if (!imgPass || prefs().logos === false) return "";
+  const d = logoDomain(addr); if (!d || Date.now() - (logoMiss.get(d) || 0) < LOGO_RETRY_MS) return "";
+  // `t`, the day: the hub's "has none" answer is cached a day and a logo a week, so a domain found or changed since is asked again the
+  // next day, not a week later.
+  return `<img class="logo" data-d="${esc(d)}" src="/api/logo?d=${encodeURIComponent(d)}&k=${encodeURIComponent(imgPass)}&t=${Math.floor(Date.now() / 864e5)}" alt="" loading="lazy" decoding="async" draggable="false">`;
+}
+document.addEventListener("error", (e) => { const el = e.target; if (el && el.tagName === "IMG" && el.classList && el.classList.contains("logo")) { logoMiss.set(el.dataset.d || "", Date.now()); el.remove(); } }, true);
 // The row names the sidebar entry the conversation is listed under, in that entry's colour: a work mailbox by its own
 // name, never its domain's. Domain mail names its domain: under a Domains entry that holds several, the domain in that
 // entry's colour, there and in that entry's own list, where the rows would otherwise not say which business they came to; a domain with
@@ -1264,7 +1381,7 @@ function shownSnippet(t) {
 function rowHtml(t, p) {
     const who = rowPeer(t);
     return `<div class="swipe l">${ACTIONS[p.swipes.right] || ""}</div><div class="swipe r">${ACTIONS[p.swipes.left] || ""}</div>
-      <div ${tileAttrs(t, who.key)}>${esc(who.initial.toUpperCase())}<span class="chk">${ico("check")}</span></div>
+      <div ${tileAttrs(t, who.key)}>${esc(who.initial.toUpperCase())}${isBiz(t) && logoShown(t) ? logoImg(t.fromAddr) : ""}<span class="chk">${ico("check")}</span></div>
       <div class="who"><span class="ud"></span><span style="overflow:hidden;text-overflow:ellipsis">${esc(who.label)}</span>${t.count > 1 ? `<span class="badge">${t.count}</span>` : ""}${isPriority(t) ? `<span class="lbl pri">priority</span>` : ""}${!t.out && state.pendingSenders.has(t.fromAddr) ? `<span class="badge" title="First time this address has written to you">new</span>` : ""}${p.setAside.includes(t.key) ? `<span class="badge">set aside</span>` : ""}${t._server ? `<span class="badge">server</span>` : ""}</div>
       <div class="when">${inboxTag(t)}<span class="tm">${when(t.date)}</span></div>
       <div class="sub fx">${draftKeys().has(t.key) ? `<span class="drafttag">Draft</span>` : ""}<bdi>${esc(shownSubject(t))}</bdi> ${(t.labels || []).filter((x) => ["trademark-scam", "blocked", "over-budget", "removed-on-server", "locked-out"].includes(x)).map((x) => `<span class="lbl scam">${esc(x)}</span>`).join("")}${trashLens(t) ? `<span class="lbl">${t.binnedIds.length} in Trash</span>` : ""}${state.search && SEARCH_TAG[t.state] ? `<span class="lbl fold">${SEARCH_TAG[t.state]}</span>` : ""}${t.starred || t.hasAtt ? `<span class="ic">${t.starred ? ico("pin") : ""}${t.hasAtt ? `<span class="hasatt" role="img" aria-label="Has attachments" title="Has attachments">${ico("attach")}</span>` : ""}</span>` : ""}</div>
@@ -1364,6 +1481,61 @@ async function backfillUnsub() {
     if (stopped) unsubBackfillTimer = setTimeout(backfillUnsub, 60000); else if (cands.length === UNSUB_BACKFILL.batch) scheduleIdle(backfillUnsub); // more may remain
   } finally { unsubBackfillBusy = false; }
 }
+// Business rows in the inbox whose newest inbound message was synced before the DMARC verdict was kept (field report
+// 2026-11-26) learn it AT ONCE, not in the background: the user opens the app and the logos are there. One messages.get (metadata,
+// Authentication-Results) for each row's newest inbound message, all of the inbox's business rows (at most 60), eight at a time, newest
+// first, repainting as they land. It runs at boot, before any sync, and after each sync for rows the sync brought. A 404 or a message
+// with no Gmail stamp is unproven; any other failure leaves the row to the next run (three failed runs leave it unproven).
+let proofBackfillBusy = false, proofBackfillAgain = false;
+const proofStats = { runs: 0, asked: 0, proven: 0, failed: 0, lastErr: "" };
+async function backfillProof() {
+  if (proofBackfillBusy) { proofBackfillAgain = true; return; }
+  if (prefs().logos === false || !navigator.onLine) return;
+  proofBackfillBusy = true; proofStats.runs++;
+  let changed = 0, lastPaint = Date.now();
+  const paint = () => { if (changed && Date.now() - lastPaint > 150) { lastPaint = Date.now(); render(); } };
+  try {
+    // `!== true`, not `=== false`: a row this device built before the verdict was kept has no proofKnown at all (field report 2026-11-26).
+    const cands = [...state.threads.values()].filter((t) => t.kind === "gmail" && t.proofKnown !== true && t.state === "inbox" && isBiz(t) && logoDomain(t.fromAddr)).sort((a, b) => b.date - a.date).slice(0, 60);
+    const one = async (t) => {
+      if (cooldownLeft(t.account)) return;
+      const recs = await idb.getByIndex("messages", "threadKey", t.key).catch(() => []);
+      const sorted = shownMessages([...(recs || [])].sort((a, b) => a.date - b.date)); if (!sorted.length) return;
+      const rec = [...sorted].reverse().find((m) => !(m.labels || []).includes("SENT")) || sorted[sorted.length - 1];   // deriveGmailThread's lastIn
+      if (rec.proven === undefined) {
+        let m = null; proofStats.asked++;
+        try { m = await gapi(t.account, `messages/${encodeURIComponent(rec.id)}?format=metadata&metadataHeaders=Authentication-Results`); }
+        catch (e) { proofStats.failed++; proofStats.lastErr = String(e?.status || "") + " " + String(e?.message || e).slice(0, 120); if (e.status !== 404) { t.proofTries = (t.proofTries || 0) + 1; if (t.proofTries < 3) return; } }
+        const ar = ((m?.payload || {}).headers || []).filter((x) => lc(x.name) === "authentication-results").map((x) => x.value);
+        rec.proven = ar.length ? provenBy(ar, "mx.google.com", rec.fromAddr) : false; if (rec.proven) proofStats.proven++;
+        await idb.putAll("messages", [rec]);
+      }
+      await rebuildGmailThreads(t.account, [t.key]); changed++; paint();
+    };
+    for (let i = 0; i < cands.length; i += 8) await Promise.all(cands.slice(i, i + 8).map((t) => one(t).catch(() => {})));
+  } finally {
+    proofBackfillBusy = false; if (changed) render(); setTimeout(() => logoReport("backfill"), 1500);
+    if (proofBackfillAgain) { proofBackfillAgain = false; setTimeout(backfillProof, 0); }
+  }
+}
+// What this device decides for each inbox row's logo, sent to the hub's app log (GET /api/applog?device=android|mac), because a release
+// web view cannot be inspected (a phone showed letters where the hub had the logos, and nothing on it said why). Domains and
+// verdicts only, no subjects or addresses. At most once in two minutes and eight times a session.
+let logoReported = { at: 0, n: 0 };
+function logoReport(why) {
+  try {
+    const device = /Android/i.test(navigator.userAgent) ? "android" : /SheritMac/i.test(navigator.userAgent) ? "mac" : "";
+    if (!device || logoReported.n >= 8 || Date.now() - logoReported.at < 120000) return;
+    logoReported = { at: Date.now(), n: logoReported.n + 1 };
+    const rows = [...state.threads.values()].filter((t) => t.state === "inbox").sort((a, b) => b.date - a.date).slice(0, 15).map((t) => {
+      const d = logoDomain(t.fromAddr), el = document.querySelector(`#threads .t[data-key="${CSS.escape(t.key)}"] img.logo`);
+      return { kind: t.kind, acct: t.kind === "gmail" ? (state.gmail || []).findIndex((g) => g.email === t.account) : -1, via: t.kind === "gmail" ? gmailViaHub(t.account) : null, dom: domainOf(t.fromAddr), cat: catOf(t), biz: isBiz(t),
+        proven: t.proven, known: t.proofKnown, logoDom: d, nameVeto: logoNameVeto(t), miss: d ? logoMiss.get(d) || 0 : 0,
+        html: !!(isBiz(t) && logoShown(t) && logoImg(t.fromAddr)), img: el ? { complete: el.complete, w: el.naturalWidth } : null };
+    });
+    api("/api/applog", { method: "POST", body: JSON.stringify({ device, kind: "logos", why, at: new Date().toISOString(), version: update.version || null, ua: navigator.userAgent.slice(0, 160), imgPass: !!imgPass, logosPref: prefs().logos !== false, threads: state.threads.size, proof: { ...proofStats, busy: proofBackfillBusy }, rows }) }).catch(() => {});
+  } catch (_) {}
+}
 // The first pictures of a mail being made ready, into this device's cache before it is opened. x-warm makes the hub
 // answer only from what it holds, so a warm-up never reaches a sender; none when the phone is saving data. The same URL as the frame's
 // own <img> request, so that request is a cache hit.
@@ -1377,7 +1549,15 @@ function warmPictures(docs) {
   const urls = [], fonts = [], sheets = [], warm = (u) => { if (warmed.has(u)) return null; if (warmed.size > 2000) warmed.clear(); warmed.add(u); return fetch(u, { headers: { "x-warm": "1" }, priority: "low", credentials: "same-origin" }).catch(() => null); };
   for (const d of docs) {
     const s = String(d);
-    for (const f of s.matchAll(/@font-face\s*\{[^{}]*\}/g)) for (const m of f[0].matchAll(FONT_FIRST)) { if (m[2] && !/^(woff2?|truetype|opentype|collection)/i.test(m[2])) continue; if (!fonts.includes(m[1])) fonts.push(m[1]); break; }
+    // the face's LAST src (the one the browser uses: index.js fontFaces), and in it the first font a browser reads: a format it knows,
+    // or none given and not an old EOT or SVG font (an IE-era face carries `src: url(x.eot); src: url(x.eot?#iefix) format("embedded-opentype"), url(x.woff2) format("woff2")`)
+    for (const f of s.matchAll(/@font-face\s*\{[^{}]*\}/g)) {
+      const src = f[0].replace(/^@font-face\s*\{|\}$/g, "").split(";").map((d) => d.trim()).filter((d) => /^src\s*:/i.test(d)).pop() || "";
+      for (const m of src.matchAll(FONT_FIRST)) {
+        if (m[2] ? !/^(woff2?|truetype|opentype|collection)/i.test(m[2]) : /\.(eot|svgz?)(?:[?#]|$)/i.test((() => { try { return decodeURIComponent(m[1].replace(/&amp;/g, "&").split("u=")[1].split("&")[0]); } catch (_) { return m[1]; } })())) continue;
+        if (!fonts.includes(m[1])) fonts.push(m[1]); break;
+      }
+    }
     for (const m of s.matchAll(/\/api\/fontcss\?u=[^"'\s<>)]+/g)) if (!sheets.includes(m[0])) sheets.push(m[0]);
     for (const m of s.replace(/@font-face\s*\{[^{}]*\}/g, " ").matchAll(/\/api\/img\?u=[^"'\s<>)]+/g)) { if (urls.length >= 4) break; const u = m[0].replace(/&amp;/g, "&"); if (!urls.includes(u)) urls.push(u); }
   }
@@ -1400,9 +1580,9 @@ function prerender(t, d) {
 const cssEsc = (v) => (typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\]/g, "\\$&");
 function setFocus(key) { if (state.focus === key) return; const prev = state.focus; state.focus = key; if (prev) $(`.t[data-key="${cssEsc(prev)}"]`)?.classList.remove("focus"); if (key) $(`.t[data-key="${cssEsc(key)}"]`)?.classList.add("focus"); }
 function syncChecks() { state.selecting = state.checked.size > 0; $("#app").classList.toggle("selecting", state.selecting); $("#selcount").textContent = `${state.checked.size} selected`; selSpam(); $$(".t").forEach((d) => d.classList.toggle("checked", state.checked.has(d.dataset.key))); }
-function selectRange(a, b) { const rows = visibleThreads().filter((t) => !isNewSender(t)); const i = rows.findIndex((t) => t.key === a), j = rows.findIndex((t) => t.key === b); if (i < 0 || j < 0) return toggleCheck(b); for (const t of rows.slice(Math.min(i, j), Math.max(i, j) + 1)) state.checked.add(t.key); state.lastChecked = b; syncChecks(); }
-function selectAll() { const rows = visibleThreads().filter((t) => !isNewSender(t)); for (const t of rows) state.checked.add(t.key); syncChecks(); toast(`${state.checked.size} selected`); }
-function selectFromHere(key = state.focus || state.cur) { const rows = visibleThreads().filter((t) => !isNewSender(t)); const i = rows.findIndex((t) => t.key === key); if (i < 0) return selectAll(); for (const t of rows.slice(i)) state.checked.add(t.key); state.lastChecked = key; syncChecks(); toast(`${state.checked.size} selected from here`); }
+function selectRange(a, b) { const rows = visibleThreads().filter((t) => !inTopBox(t)); const i = rows.findIndex((t) => t.key === a), j = rows.findIndex((t) => t.key === b); if (i < 0 || j < 0) return toggleCheck(b); for (const t of rows.slice(Math.min(i, j), Math.max(i, j) + 1)) state.checked.add(t.key); state.lastChecked = b; syncChecks(); }
+function selectAll() { const rows = visibleThreads().filter((t) => !inTopBox(t)); for (const t of rows) state.checked.add(t.key); syncChecks(); toast(`${state.checked.size} selected`); }
+function selectFromHere(key = state.focus || state.cur) { const rows = visibleThreads().filter((t) => !inTopBox(t)); const i = rows.findIndex((t) => t.key === key); if (i < 0) return selectAll(); for (const t of rows.slice(i)) state.checked.add(t.key); state.lastChecked = key; syncChecks(); toast(`${state.checked.size} selected from here`); }
 function clearSelection() { state.checked.clear(); state.lastChecked = null; syncChecks(); }
 function toggleCheck(key) { if (state.checked.has(key)) state.checked.delete(key); else { state.checked.add(key); state.lastChecked = key; } state.selecting = state.checked.size > 0; $("#app").classList.toggle("selecting", state.selecting); $("#selcount").textContent = `${state.checked.size} selected`; selSpam(); $$(".t").forEach((d) => d.classList.toggle("checked", state.checked.has(d.dataset.key))); }
 // ---------- drag to select ----------
@@ -1440,7 +1620,7 @@ window.addEventListener("pointermove", (e) => {
   dragSel.x = e.clientX; dragSel.y = e.clientY;
   if (!dragSel.on) {
     if (Math.abs(e.clientY - dragSel.y0) < 6) return;
-    dragSel.keys = visibleThreads().filter((t) => !isNewSender(t)).map((t) => t.key); dragSel.idx = new Map(dragSel.keys.map((k, n) => [k, n]));
+    dragSel.keys = visibleThreads().filter((t) => !inTopBox(t)).map((t) => t.key); dragSel.idx = new Map(dragSel.keys.map((k, n) => [k, n]));
     dragSel.base = dragSel.add ? new Set(state.checked) : new Set(); dragSel.on = true;
     try { $("#threads").setPointerCapture(e.pointerId); } catch (_) {}
     try { getSelection().removeAllRanges(); } catch (_) {}
@@ -2391,6 +2571,7 @@ function setImgPass(k) {
   if (!k || k === imgPass) return; imgPass = k;
   try { localStorage.setItem("mh:ik", k); } catch (_) {}
   try { prerendered.clear(); } catch (_) {}   // bodies rendered with the old key would ask for images the hub now refuses
+  logoMiss.clear();   // a logo refused under the old key is asked again under the new one
 }
 // The size a picture is asked for: the hub keeps a 1080 px WebP for phones and a 1600 px one for wider screens.
 const picW = () => { try { return matchMedia(PHONE_MQ).matches ? 1080 : 1600; } catch (_) { return 1600; } };
@@ -2914,7 +3095,7 @@ const tagSafeMsg = (m) => m && m.html && !m.text ? { ...m, html: tagSafe(dropHtm
 // and after a failure again on a draw a minute later at the soonest. A message drawn before it is in just has no banner.
 let impostorAsk = null;
 function impostorKnownNow() {
-  if (!state.impostorKnown && !impostorAsk) impostorAsk = api("/api/senders/orgs").then((r) => { state.impostorKnown = impostorKnownOf(r.orgs || []); }).catch(() => { setTimeout(() => { impostorAsk = null; }, 60e3); });
+  if (!state.impostorKnown && !impostorAsk) impostorAsk = api("/api/senders/orgs").then((r) => { state.impostorKnown = impostorKnownOf(r.orgs || []); state.logoProtect = impostorKnownOf([...(r.orgs || []), ...(r.brands || [])]); render(); }).catch(() => { setTimeout(() => { impostorAsk = null; }, 60e3); });
   return state.impostorKnown || null;
 }
 function trustBar(m) {
@@ -3427,7 +3608,9 @@ function messageHead(m, collapsed, nFiles, ct = null) {
   const rt = m.replyTo && addrOf(m.replyTo) !== addrOf(m.from) ? m.replyTo : "";
   // the conversation comes from prerender, which builds the page before it is opened, so state.cur may still be another one
   const fa = lc(m.fromAddr || addrOf(m.from));
-  return `<div class="h"><span class="hav${!m.out && isBiz(ct) && fa === lc(ct.fromAddr) ? " biz" : ""}" aria-hidden="true" style="--h:${hueFor(m.fromAddr || addrOf(m.from))}">${esc((nm || "?")[0].toUpperCase())}</span>`
+  const biz = !m.out && isBiz(ct) && fa === lc(ct.fromAddr);
+  const mproven = biz && provenBy(m.authResults, ct.kind === "gmail" ? "mx.google.com" : "mx.cloudflare.net", fa) && logoShown({ ...ct, proven: true });   // this message's own stamp
+  return `<div class="h"><span class="hav${biz ? " biz" : ""}" aria-hidden="true" style="--h:${hueFor(m.fromAddr || addrOf(m.from))}">${esc((nm || "?")[0].toUpperCase())}${mproven ? logoImg(fa) : ""}</span>`
     + `<div class="who2" title="Show details"><div class="l1"><span class="from">${esc(nm)}${mine ? `<span class="fid">${esc(mine)}</span>` : ""}</span><span class="when">${esc(when(m.date))}</span></div>`
     + `<div class="l2">${esc([to, time].filter(Boolean).join(" · "))}${flags}<span class="chev">${ico("chevron")}</span></div>`
     + (collapsed ? `<div class="l3">${clip}<span class="pv">${esc(messagePreview(m))}</span></div>` : "") + `</div></div>`
@@ -3638,6 +3821,7 @@ async function openThread(key, { reload = false, data = null } = {}) {
   mountBodies(ms, pre.docs);   // the open messages' mail, parsed and sized before this task ends
   fillTrustAges(ms);   // only a banner that is showing asks anything of the network
   wireLockBars(ms);
+  mountInvites(ms, d, t);   // invitations: their card, once the calendar part is read
   ms.querySelector(".expall")?.addEventListener("click", (e) => { ms.querySelectorAll(".m.collapsed").forEach((x) => x.classList.remove("collapsed")); e.currentTarget.remove(); mountBodies(ms, pre.docs); });
   ms.scrollTop = 0;   // the newest message is at the top
   if (!reload) { const rows = visibleThreads(); const i = rows.findIndex((x) => x.key === key); scheduleIdle(() => prefetchBodies([rows[i + 1], rows[i - 1]].filter(Boolean))); }
@@ -4326,6 +4510,362 @@ async function reopenDraft(args) {
   if (args.forwardOf) state.fwd = { t: { kind: "hub" }, m: { id: args.forwardOf } };
   editors.c.revive = true; editors.c.sig = ""; draftFlush("c");   // back in Drafts, under its own id
 }
+// ---------- calendar invitations ----------
+// An invitation in the mail (text/calendar, RFC 5545, sent as RFC 6047 iMIP) shows as a card above the message: what, when in your own
+// time, where, the video link, who asked and who else is coming; Yes / Maybe / No send the organizer an iTIP REPLY from the address
+// the invitation is to, the way Outlook and Google Calendar answer one (their calendars read it); Add to calendar opens its calendar file.
+// A cancellation says so; an answer to an invitation of yours says who answered what.
+const icsUnfold = (s) => String(s || "").replace(/\r\n?/g, "\n").replace(/\n[ \t]/g, "");
+function icsLine(l) {   // NAME;P1=V1;P2="V:2":VALUE
+  let i = 0, q = false; for (; i < l.length; i++) { const c = l[i]; if (c === '"') q = !q; else if (c === ":" && !q) break; }
+  const parts = []; let cur = ""; q = false; for (const c of l.slice(0, i)) { if (c === '"') { q = !q; continue; } if (c === ";" && !q) { parts.push(cur); cur = ""; } else cur += c; } parts.push(cur);
+  const name = parts.shift().toUpperCase(), params = {}; for (const p of parts) { const j = p.indexOf("="); if (j > 0) params[p.slice(0, j).toUpperCase()] = p.slice(j + 1); }
+  return { name, params, value: l.slice(i + 1) };
+}
+const icsText = (v) => String(v || "").replace(/\\n/gi, "\n").replace(/\\([,;\\])/g, "$1");
+const mailtoOf = (v) => lc(String(v || "").replace(/^mailto:/i, "").trim());
+function parseIcs(src) {
+  const cal = { method: "", events: [], zones: {}, zoneRaw: {} }, stack = []; let ev = null, zone = null, sub = null, zraw = null;
+  for (const raw of icsUnfold(src).split("\n")) {
+    if (!raw.trim()) continue; const l = icsLine(raw), v = String(l.value || "").trim().toUpperCase();
+    if (l.name === "BEGIN") { stack.push(v); if (v === "VEVENT" && stack.length === 2) ev = { attendees: [], raw: {} }; else if (v === "VTIMEZONE") { zone = { id: "" }; zraw = []; } else if (zone && (v === "STANDARD" || v === "DAYLIGHT")) sub = {}; if (zraw) zraw.push(raw); continue; }
+    if (l.name === "END") { const top = stack.pop(); if (zraw) zraw.push(raw);
+      if (top === "VEVENT" && ev && stack.length === 1) { cal.events.push(ev); ev = null; }
+      else if (top === "VTIMEZONE" && zone) { if (zone.id) { cal.zones[zone.id] = zone; cal.zoneRaw[zone.id] = zraw.join("\r\n"); } zone = null; zraw = null; }
+      else if (sub && (top === "STANDARD" || top === "DAYLIGHT")) { if (!zone[top] || top === "DAYLIGHT") zone[top] = sub; if ((zone.obs ||= []).length < 200) zone.obs.push({ kind: top, ...sub }); sub = null; }
+      continue; }
+    if (zraw) zraw.push(raw);
+    if (stack.length === 1 && l.name === "METHOD") cal.method = v;
+    if (sub) { if (l.name === "TZOFFSETTO") sub.to = l.value.trim(); else if (l.name === "TZOFFSETFROM") sub.from = l.value.trim(); else if (l.name === "TZNAME") sub.name = l.value.trim(); else if (l.name === "RRULE") sub.rrule = l.value.trim(); else if (l.name === "DTSTART") sub.start = l.value.trim(); continue; }
+    if (zone) { if (l.name === "TZID") zone.id = l.value.trim(); continue; }
+    if (!ev || stack[stack.length - 1] !== "VEVENT") continue;   // an alarm inside the event is not the event
+    const when = () => ({ value: l.value.trim(), tzid: l.params.TZID || "", date: lc(l.params.VALUE || "") === "date" || /^\d{8}$/.test(l.value.trim()) });
+    switch (l.name) {
+      case "UID": ev.uid = l.value.trim(); break; case "SUMMARY": ev.summary = icsText(l.value); break; case "LOCATION": ev.location = icsText(l.value); break;
+      case "DESCRIPTION": ev.description = icsText(l.value); break; case "SEQUENCE": ev.sequence = parseInt(l.value, 10) || 0; break; case "STATUS": ev.status = v; break;
+      case "RRULE": ev.rrule = l.value.trim(); break; case "URL": ev.url = l.value.trim(); break; case "DURATION": ev.duration = l.value.trim(); break;
+      case "DTSTART": ev.start = when(); ev.raw.DTSTART = raw; break; case "DTEND": ev.end = when(); ev.raw.DTEND = raw; break;
+      case "RECURRENCE-ID": ev.recur = when(); ev.raw["RECURRENCE-ID"] = raw; break;
+      case "ORGANIZER": ev.organizer = { addr: mailtoOf(l.value), name: l.params.CN || "" }; ev.raw.ORGANIZER = raw; break;
+      case "ATTENDEE": ev.attendees.push({ addr: mailtoOf(l.value), name: l.params.CN || "", partstat: (l.params.PARTSTAT || "NEEDS-ACTION").toUpperCase(), role: (l.params.ROLE || "").toUpperCase() }); break;
+      default: if (/^X-(GOOGLE-CONFERENCE|MICROSOFT-SKYPETEAMSMEETINGURL|MICROSOFT-ONLINEMEETINGJOINURL)$/.test(l.name)) ev.conf = l.value.trim();
+    }
+  }
+  return cal;
+}
+// Time zones: an IANA name through Intl; a Windows one (Outlook's "Central Standard Time", or "(UTC-06:00) Central Time (US & Canada)")
+// through the usual mapping; else the invitation's own VTIMEZONE rules; a time with no zone is the viewer's own clock (floating).
+const WIN_TZ = { "eastern standard time": "America/New_York", "eastern time (us & canada)": "America/New_York", "us eastern standard time": "America/Indiana/Indianapolis", "central standard time": "America/Chicago", "central time (us & canada)": "America/Chicago", "mountain standard time": "America/Denver", "mountain time (us & canada)": "America/Denver", "us mountain standard time": "America/Phoenix", "arizona": "America/Phoenix", "pacific standard time": "America/Los_Angeles", "pacific time (us & canada)": "America/Los_Angeles", "alaskan standard time": "America/Anchorage", "alaska": "America/Anchorage", "hawaiian standard time": "Pacific/Honolulu", "hawaii": "Pacific/Honolulu", "atlantic standard time": "America/Halifax", "newfoundland standard time": "America/St_Johns", "canada central standard time": "America/Regina", "mexico standard time": "America/Mexico_City", "central standard time (mexico)": "America/Mexico_City", "sa pacific standard time": "America/Bogota", "sa western standard time": "America/La_Paz", "venezuela standard time": "America/Caracas", "sa eastern standard time": "America/Cayenne", "central america standard time": "America/Guatemala", "us eastern standard time (indiana)": "America/Indiana/Indianapolis", "pacific sa standard time": "America/Santiago", "e. south america standard time": "America/Sao_Paulo", "argentina standard time": "America/Argentina/Buenos_Aires", "gmt standard time": "Europe/London", "greenwich standard time": "Atlantic/Reykjavik", "w. europe standard time": "Europe/Berlin", "romance standard time": "Europe/Paris", "central europe standard time": "Europe/Budapest", "central european standard time": "Europe/Warsaw", "e. europe standard time": "Europe/Chisinau", "fle standard time": "Europe/Kiev", "gtb standard time": "Europe/Bucharest", "turkey standard time": "Europe/Istanbul", "russian standard time": "Europe/Moscow", "israel standard time": "Asia/Jerusalem", "egypt standard time": "Africa/Cairo", "south africa standard time": "Africa/Johannesburg", "arabian standard time": "Asia/Dubai", "india standard time": "Asia/Kolkata", "se asia standard time": "Asia/Bangkok", "china standard time": "Asia/Shanghai", "taipei standard time": "Asia/Taipei", "singapore standard time": "Asia/Singapore", "tokyo standard time": "Asia/Tokyo", "korea standard time": "Asia/Seoul", "aus eastern standard time": "Australia/Sydney", "e. australia standard time": "Australia/Brisbane", "cen. australia standard time": "Australia/Adelaide", "w. australia standard time": "Australia/Perth", "new zealand standard time": "Pacific/Auckland", "utc": "UTC", "coordinated universal time": "UTC" };
+const tzOk = (z) => { try { new Intl.DateTimeFormat("en-US", { timeZone: z }); return z; } catch (_) { return null; } };
+function ianaOf(tzid) {
+  const z = String(tzid || "").trim(), tail = z.match(/([A-Za-z]+\/[A-Za-z_+-]+(?:\/[A-Za-z_+-]+)?)$/);
+  return (z && /\//.test(z) && tzOk(z)) || (tail && tzOk(tail[1])) || WIN_TZ[lc(z.replace(/^\(UTC[^)]*\)\s*/i, ""))] || (lc(z) === "utc" ? "UTC" : null);
+}
+function zoneOffsetMs(zone, utc) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: zone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).formatToParts(new Date(utc)).map((x) => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - utc;
+}
+const wallToUtc = (wall, zone) => { const o1 = zoneOffsetMs(zone, wall), t = wall - o1, o2 = zoneOffsetMs(zone, t); return o2 === o1 ? t : wall - o2; };
+const icsOff = (s) => { const m = /^([+-])(\d\d)(\d\d)(\d\d)?$/.exec(String(s || "").trim()); return m ? (m[1] === "-" ? -1 : 1) * ((+m[2] * 60 + +m[3]) * 60 + +(m[4] || 0)) * 1000 : 0; };
+function ruleWall(year, rrule, start) {   // a yearly BYMONTH/BYDAY change of a VTIMEZONE, as a wall time (UTC arithmetic)
+  const r = Object.fromEntries(String(rrule || "").split(";").map((x) => x.split("="))), mo = (+r.BYMONTH || 1) - 1, hh = +String(start || "").slice(9, 11) || 0, mm = +String(start || "").slice(11, 13) || 0;
+  const bd = /^([+-]?\d)?(SU|MO|TU|WE|TH|FR|SA)$/.exec(r.BYDAY || ""); if (!bd) return Date.UTC(year, mo, +String(start || "").slice(6, 8) || 1, hh, mm);
+  const wd = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].indexOf(bd[2]), n = +(bd[1] || 1);
+  if (n > 0) { const first = new Date(Date.UTC(year, mo, 1)).getUTCDay(); return Date.UTC(year, mo, 1 + ((wd - first + 7) % 7) + (n - 1) * 7, hh, mm); }
+  const last = new Date(Date.UTC(year, mo + 1, 0)); return Date.UTC(year, mo, last.getUTCDate() - ((last.getUTCDay() - wd + 7) % 7) + (n + 1) * 7, hh, mm);
+}
+// The offset in force at a wall time: of every change the zone names (a yearly RRULE's in this year and the last, or a DTSTART given
+// once), the latest at or before it; before all of them, its standard time (a zone written as explicit changes fell back
+// to standard time all summer).
+const icsWall = (s) => { const m = /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)?$/.exec(String(s || "")); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : null; };
+function vtzOffset(z, wall, year) {
+  const obs = z.obs && z.obs.length ? z.obs : [z.STANDARD && { kind: "STANDARD", ...z.STANDARD }, z.DAYLIGHT && { kind: "DAYLIGHT", ...z.DAYLIGHT }].filter(Boolean);
+  let best = null, at = -Infinity;
+  for (const o of obs) {
+    const until = o.rrule ? icsWall(((/(?:^|;)UNTIL=(\d{8}T\d{6})/i.exec(o.rrule) || [])[1]) || "") : null, first = icsWall(o.start);   // a rule runs from its DTSTART to its UNTIL
+    for (const t of o.rrule ? [ruleWall(year - 1, o.rrule, o.start), ruleWall(year, o.rrule, o.start)] : [first]) if (t != null && t <= wall && t > at && (until == null || t <= until) && (first == null || !o.rrule || t >= first)) { best = o; at = t; }
+  }
+  return icsOff((best || obs.find((o) => o.kind === "STANDARD") || obs[0] || {}).to);
+}
+function icsTime(p, cal) {
+  const m = p && /^(\d{4})(\d\d)(\d\d)(?:T(\d\d)(\d\d)(\d\d)?(Z)?)?$/.exec(p.value); if (!m) return null;
+  const y = +m[1], mo = +m[2] - 1, d = +m[3], wall = Date.UTC(y, mo, d, +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  if (p.date || !m[4]) return { ms: wall, allDay: true };
+  if (m[7]) return { ms: wall };
+  const zone = p.tzid ? ianaOf(p.tzid) : null; if (zone) return { ms: wallToUtc(wall, zone), zone };
+  const vz = p.tzid && cal.zones[p.tzid]; if (vz) return { ms: wall - vtzOffset(vz, wall, y) };
+  return { ms: new Date(y, mo, d, +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)).getTime(), floating: true };
+}
+const icsDur = (s) => { const m = /^([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(String(s || "")); return m ? ((((+(m[2] || 0) * 7 + +(m[3] || 0)) * 24 + +(m[4] || 0)) * 60 + +(m[5] || 0)) * 60 + +(m[6] || 0)) * 1000 : 0; };
+function inviteWhen(ev, cal) {
+  const s = icsTime(ev.start, cal); if (!s) return null;
+  let e = icsTime(ev.end, cal); if (!e) e = { ms: s.ms + (icsDur(ev.duration) || (s.allDay ? 864e5 : 0)), allDay: s.allDay };
+  return { start: s.ms, end: e.ms, allDay: !!s.allDay };
+}
+function whenText(w) {
+  if (!w) return "";
+  if (w.allDay) {
+    const f = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }), last = w.end - 864e5;
+    return last > w.start ? `${f.format(w.start)} – ${f.format(last)} (all day)` : `${f.format(w.start)} (all day)`;
+  }
+  const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" }), tm = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }), tz = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(w.start).find((x) => x.type === "timeZoneName")?.value || "";
+  const same = new Date(w.start).toDateString() === new Date(w.end).toDateString();
+  return same ? `${day.format(w.start)} · ${tm.format(w.start)} – ${tm.format(w.end)} ${tz}` : `${day.format(w.start)}, ${tm.format(w.start)} – ${day.format(w.end)}, ${tm.format(w.end)} ${tz}`;
+}
+const RRULE_WORD = { DAILY: "Repeats daily", WEEKLY: "Repeats weekly", MONTHLY: "Repeats monthly", YEARLY: "Repeats yearly" };
+const VIDEO_RX = /https:\/\/(?:[\w-]+\.)?(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|teams\.live\.com|webex\.com|whereby\.com|gotomeeting\.com|meet\.jit\.si)\/[^\s<>"')]+/i;
+const PARTSTAT_WORD = { ACCEPTED: "accepted", TENTATIVE: "said maybe to", DECLINED: "declined", DELEGATED: "delegated", "NEEDS-ACTION": "has not answered" };
+// Where an invitation in a message is: a calendar part Gmail handed over in the message, or a calendar file among its attachments.
+function inviteSource(m) {
+  if (m.calendar) return m.calendar;
+  const a = (m.attachments || []).find((x) => /^(text\/calendar|application\/ics)/i.test(x.mime || "") || /\.ics$/i.test(x.name || ""));
+  return a ? { att: a } : null;
+}
+const inviteCache = new Map();   // message id -> the parsed invitation (or null), for this session
+async function inviteOf(t, m) {
+  if (inviteCache.has(m.id)) return inviteCache.get(m.id);
+  const src = inviteSource(m); if (!src) return null;
+  let text = src.data || "";
+  if (!text && src.att && (src.att.size || 0) <= 512 * 1024) { try { text = new TextDecoder().decode(await attBytes(t, src.att)); } catch (_) { return null; } }
+  if (!text && src.attId) { try { text = new TextDecoder().decode(await adapterFor(t.account).attachment(src.msgId, src.attId)); } catch (_) { return null; } }
+  // a copy the hub stored earlier as the text of its byte values ("66,69,71,..."), as a device may still hold it
+  if (/^\d{1,3}(,\d{1,3})+\s*$/.test(text)) text = new TextDecoder().decode(Uint8Array.from(text.trim().split(","), Number));
+  const cal = /BEGIN:VCALENDAR/i.test(text) ? parseIcs(text) : null; const ev = cal && (cal.events.find((e) => !e.recur) || cal.events[0]);
+  const v = ev ? { cal, ev, att: src.att || null, text } : null; inviteCache.set(m.id, v); return v;
+}
+// The address of yours the invitation is to: an attendee that is you, else the address the mail came to.
+function rsvpAddr(t, m, ev) {
+  const a = ev.attendees.find((x) => isMine(x.addr)); if (a) return a.addr;
+  if (t.kind === "gmail") return t.account;
+  return lc(m.identity || "") || null;
+}
+const icsEsc = (s) => String(s || "").replace(/[\;,]/g, (c) => "\\" + c).replace(/\r?\n/g, "\\n");
+const icsFold = (line) => { const out = []; let cur = "", n = 0; for (const ch of line) { const b = new TextEncoder().encode(ch).length; if (n + b > (out.length ? 74 : 75)) { out.push(cur); cur = ""; n = 0; } cur += ch; n += b; } out.push(cur); return out.join("\r\n "); };
+const icsStamp = (ms) => new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+// The REPLY is written from the values read, each checked for its shape: the invitation's own DTSTART, ORGANIZER and
+// VTIMEZONE lines were copied, so a crafted one put whatever it carried into a message the user sends.
+const icsParamOk = (v) => /^[^\x00-\x1f"]{1,100}$/.test(v || "");   // RFC 5545: a parameter value with;: or, is written quoted
+const icsWhenLine = (name, p) => p && /^\d{8}(T\d{6}Z?)?$/.test(p.value || "") ? `${name}${p.date ? ";VALUE=DATE" : ""}${p.tzid && icsParamOk(p.tzid) ? `;TZID=${/[;:,]/.test(p.tzid) ? `"${p.tzid}"` : p.tzid}` : ""}:${p.value}` : null;
+const icsCn = (n) => { const c = String(n || "").replace(/[\x00-\x1f"]/g, "").slice(0, 100); return c ? `;CN="${c}"` : ""; };
+const icsAddrOk = (a) => /^[^\s"<>;:,()\\]+@[^\s"<>;:,()\\]+\.[a-z0-9-]+$/i.test(a || "");
+function icsZone(cal, id) {
+  const z = cal.zones[id]; if (!z || !icsParamOk(id)) return [];
+  const part = (k) => { const x = z[k]; if (!x || !/^[+-]\d{4}(\d\d)?$/.test(x.to || "")) return []; return [`BEGIN:${k}`, ...(/^\d{8}T\d{6}$/.test(x.start || "") ? [`DTSTART:${x.start}`] : []), ...(/^[+-]\d{4}(\d\d)?$/.test(x.from || "") ? [`TZOFFSETFROM:${x.from}`] : []), `TZOFFSETTO:${x.to}`, ...(/^[A-Z0-9=;,+-]{1,200}$/i.test(x.rrule || "") ? [`RRULE:${x.rrule}`] : []), ...(/^[A-Za-z0-9+ _-]{1,40}$/.test(x.name || "") ? [`TZNAME:${x.name}`] : []), `END:${k}`]; };
+  const one = (x, k) => (!x || !/^[+-]\d{4}(\d\d)?$/.test(x.to || "")) ? [] : [`BEGIN:${k}`, ...(/^\d{8}T\d{6}$/.test(x.start || "") ? [`DTSTART:${x.start}`] : []), ...(/^[+-]\d{4}(\d\d)?$/.test(x.from || "") ? [`TZOFFSETFROM:${x.from}`] : []), `TZOFFSETTO:${x.to}`, ...(/^[A-Z0-9=;,+-]{1,200}$/i.test(x.rrule || "") ? [`RRULE:${x.rrule}`] : []), ...(/^[A-Za-z0-9+ _-]{1,40}$/.test(x.name || "") ? [`TZNAME:${x.name}`] : []), `END:${k}`];
+  const body = z.obs && z.obs.length ? z.obs.flatMap((o) => one(o, o.kind)) : [...part("STANDARD"), ...part("DAYLIGHT")];
+  return body.length ? ["BEGIN:VTIMEZONE", `TZID:${id}`, ...body, "END:VTIMEZONE"] : [];
+}
+function rsvpIcs(cal, ev, me, myName, partstat, now = Date.now()) {
+  const zones = [...new Set([ev.start?.tzid, ev.end?.tzid, ev.recur?.tzid].filter(Boolean))].flatMap((z) => icsZone(cal, z));
+  const org = ev.organizer && icsAddrOk(ev.organizer.addr) ? `ORGANIZER${icsCn(ev.organizer.name)}:mailto:${ev.organizer.addr}` : null;
+  const lines = ["BEGIN:VCALENDAR", "PRODID:-//Sherit Mail//EN", "VERSION:2.0", "CALSCALE:GREGORIAN", "METHOD:REPLY", ...zones, "BEGIN:VEVENT",
+    `UID:${String(ev.uid || "").replace(/[\x00-\x1f]/g, "")}`, `DTSTAMP:${icsStamp(now)}`, icsWhenLine("DTSTART", ev.start), icsWhenLine("DTEND", ev.end), icsWhenLine("RECURRENCE-ID", ev.recur),
+    `SEQUENCE:${Math.max(0, Math.min(1e6, ev.sequence || 0))}`, org, `ATTENDEE;PARTSTAT=${partstat}${icsCn(myName)}:mailto:${me}`, `SUMMARY:${icsEsc(ev.summary || "")}`, "END:VEVENT", "END:VCALENDAR"].filter(Boolean);
+  return lines.map((l) => icsFold(l.replace(/[\r\n]/g, ""))).join("\r\n") + "\r\n";
+}
+const RSVP_WORD = { ACCEPTED: "Accepted", TENTATIVE: "Tentative", DECLINED: "Declined" };
+async function rsvp(t, m, inv, partstat) {
+  const { cal, ev } = inv, me = rsvpAddr(t, m, ev), org = ev.organizer?.addr;
+  if (!me) return toast("No address of yours is on this invitation");
+  if (!org || !icsAddrOk(org)) return toast("This invitation names no organizer to answer");
+  const myName = nameFor(me) || (state.gmail || []).find((g) => g.email === me)?.name || "";
+  const word = RSVP_WORD[partstat], who = myName || me;
+  const text = `${who} ${partstat === "ACCEPTED" ? "accepted" : partstat === "DECLINED" ? "declined" : "said maybe to"} this invitation: ${ev.summary || "(no title)"}\n${whenText(inviteWhen(ev, cal))}`;
+  const ics = rsvpIcs(cal, ev, me, myName, partstat);
+  const gm = state.gmail.some((g) => g.email === me && g.status === "active");
+  const draft = { from: me, from_name: myName, to: [org], subject: `${word}: ${ev.summary || "Invitation"}`, text, calendar: { method: "REPLY", ics },
+    ...(gm ? { ...replyHeaders(m), threadId: t.kind === "gmail" && t.account === me ? t.id : undefined, messageId: `${uuid4()}@mail.gmail.com` } : { in_reply_to: m.msgIdHdr || undefined }) };
+  const row = await queueSend({ gmail: gm ? me : null, draft });
+  if (!row) return;
+  const all = { ...(prefs().rsvp || {}) }; all[ev.uid] = { p: partstat, at: Date.now() };
+  const keep = Object.entries(all).sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 300); await setPref("rsvp", Object.fromEntries(keep));
+}
+function inviteCard(t, m, inv) {
+  const { cal, ev } = inv, w = inviteWhen(ev, cal), me = rsvpAddr(t, m, ev), mineOrg = ev.organizer && isMine(ev.organizer.addr);
+  const canceled = cal.method === "CANCEL" || ev.status === "CANCELLED", answer = cal.method === "REPLY";
+  const said = (prefs().rsvp || {})[ev.uid]?.p || ev.attendees.find((a) => a.addr === me && a.partstat !== "NEEDS-ACTION")?.partstat || "";
+  const video = [ev.conf, ev.location, ev.description, ev.url].map((x) => VIDEO_RX.exec(x || "")?.[0]).find(Boolean) || "";   // a known video service's https link only, even from X-GOOGLE-CONFERENCE
+  const locUrl = /^https:\/\/\S+$/i.test(ev.location || "") ? ev.location : "";   // shown in full, as any link in the mail
+  const guests = ev.attendees.filter((a) => a.role !== "NON-PARTICIPANT");
+  const card = document.createElement("div"); card.className = "invite" + (canceled ? " canceled" : "");
+  const line = (label, html) => html ? `<div class="iv-l"><span class="iv-k">${label}</span><span>${html}</span></div>` : "";
+  const answered = answer ? ev.attendees.map((a) => `${esc(a.name || a.addr)} ${PARTSTAT_WORD[a.partstat] || "answered"} this invitation`).join("<br>") : "";
+  card.innerHTML = `<div class="iv-t">${ico("scheduled")}<b>${esc(ev.summary || "(no title)")}</b>${canceled ? `<span class="iv-x">Canceled</span>` : ""}</div>`
+    + line("When", esc(whenText(w)) + (ev.rrule && RRULE_WORD[(/FREQ=(\w+)/.exec(ev.rrule) || [])[1]] ? ` · ${RRULE_WORD[/FREQ=(\w+)/.exec(ev.rrule)[1]]}` : ""))
+    + line("Where", locUrl ? `<a class="tl" href="${esc(locUrl)}">${esc(locUrl)}</a>` : esc(ev.location || ""))
+    + line("Join", video ? `<a class="tl" href="${esc(video)}">${esc(video.replace(/^https:\/\//, "").slice(0, 48))}</a>` : "")
+    + line("From", ev.organizer ? esc(ev.organizer.name ? `${ev.organizer.name} <${ev.organizer.addr}>` : ev.organizer.addr) : "")
+    + line("Guests", !answer && guests.length ? esc(guests.slice(0, 6).map((a) => a.name || a.addr).join(", ") + (guests.length > 6 ? ` +${guests.length - 6}` : "")) : "")
+    + (answered ? `<div class="iv-l iv-ans">${answered}</div>` : "")
+    + (!canceled && !answer && !mineOrg && cal.method !== "PUBLISH" && ev.organizer && icsAddrOk(ev.organizer.addr) && ev.uid ? `<div class="iv-b">${[["ACCEPTED", "Yes"], ["TENTATIVE", "Maybe"], ["DECLINED", "No"]].map(([p, l]) => `<button data-rsvp="${p}"${said === p ? ` class="primary" aria-pressed="true"` : ""}>${l}</button>`).join("")}${said ? `<span class="iv-said">You said ${esc({ ACCEPTED: "yes", TENTATIVE: "maybe", DECLINED: "no" }[said] || "")}</span>` : ""}<span style="flex:1"></span>${inv.att ? `<button class="ghost" data-ivadd>${ico("download")}Add to calendar</button>` : ""}</div>` : (inv.att && !canceled && !answer ? `<div class="iv-b"><span style="flex:1"></span><button class="ghost" data-ivadd>${ico("download")}Add to calendar</button></div>` : ""));
+  card.querySelectorAll("[data-rsvp]").forEach((b) => b.onclick = async (e) => { e.stopPropagation(); card.querySelectorAll("[data-rsvp]").forEach((x) => x.disabled = true); try { await rsvp(t, m, inv, b.dataset.rsvp); } finally { const fresh = inviteCard(t, m, inv); card.replaceWith(fresh); } });
+  card.querySelector("[data-ivadd]")?.addEventListener("click", (e) => { e.stopPropagation(); attDownload(t, inv.att); });
+  wireTextLinks(card);
+  return card;
+}
+async function mountInvites(ms, d, t) {
+  const divs = [...ms.querySelectorAll(".m")];
+  for (const [i, div] of divs.entries()) {
+    const m = d.messages[d.messages.length - 1 - i]; if (!m || !inviteSource(m) || div.querySelector(".invite")) continue;
+    const inv = await inviteOf(t, m); if (!inv || state.cur !== t.key || !div.isConnected || div.querySelector(".invite")) continue;
+    const at = div.querySelector(":scope > .atts") || div.querySelector(":scope > .b"); if (at) at.insertAdjacentElement("beforebegin", inviteCard(t, m, inv));
+  }
+}
+// ---------- big files as links ----------
+// As Apple's Mail Drop: files too big for the way a message goes out (the hub's sends stop at 5 MiB, the work server's at 25 MiB with
+// base64, Gmail's at 25 MB) go as download links in the message instead, the biggest first until the rest fit; the hub keeps them 30
+// days (index.js dropsApi). Uploaded at Send, after the send checks, in the hub's 8 MiB parts, each retried twice.
+const SEND_ROOM = { hub: 4.75 * 1048576, imap: 17.5 * 1048576, gmail: 17.5 * 1048576 };   // file bytes before base64, less the body (bigFilesOf): Gmail 18,750,000 at most, the work server 18.75 MiB, the hub 5 MiB with its text
+const sendRoomOf = (from) => { const f = lc(from || ""); return state.gmail.some((g) => g.email === f && g.status === "active") ? SEND_ROOM.gmail : imapAccts().some((a) => lc(a.email) === f) ? SEND_ROOM.imap : SEND_ROOM.hub; };
+// `body`: the message's own words, quote included; its text and HTML parts (four times its bytes) and 256 KB for MIME's own lines come out of
+// the same room. The rooms are file bytes before base64: Gmail's 25,000,000 encoded is 18,750,000 of them, the work
+// server's 25 MiB 18.75 MiB, the hub's own check counts 5 MiB of decoded bytes with the text; each room keeps a margin under that.
+// The bytes a message's own parts will take, measured from the parts as they will be sent: the text, and the HTML part its previews and
+// Markdown make, or one as big as the text where the hub writes the HTML itself (a letterhead).
+function sendBodySize(text, md, previews) { const p = withPreviews(withFormat({ text }, md), previews || []); return bodyBytes(p.text) + bodyBytes(p.html || p.text); }
+const bodyBytes = (t) => { try { return new TextEncoder().encode(String(t || "")).length; } catch (_) { return String(t || "").length * 3; } };
+function bigFilesOf(files, from, body = "") {
+  const room = sendRoomOf(from) - ((typeof body === "number" ? body : bodyBytes(body) * 4) + 262144);   // a number: the message's own parts, measured
+  const big = new Set(); let total = files.reduce((n, f) => n + f.size, 0);
+  for (const f of [...files].sort((a, b) => b.size - a.size)) { if (total <= room) break; big.add(f); total -= f.size; }
+  return big;
+}
+const sizeWord = (n) => n >= 1073741824 ? `${(n / 1073741824).toFixed(1)} GB` : fmtSize(n);
+async function dropUpload(f, onPart) {
+  const c = await api("/api/drops", { method: "POST", body: JSON.stringify({ name: f.name, type: f.type || "application/octet-stream", size: f.size }) });
+  const parts = [];
+  for (let n = 1; n <= c.parts; n++) {
+    const blob = f.slice((n - 1) * c.part, Math.min(f.size, n * c.part)); let r = null, err = null;
+    for (let tries = 0; tries < 3; tries++) {
+      try { r = await fetch(`/api/drops/${c.id}/parts/${n}`, { method: "PUT", credentials: "same-origin", body: blob, headers: { "content-type": "application/octet-stream" }, signal: AbortSignal.timeout(180000) }); err = null; if (r.ok || r.status < 500) break; }
+      catch (e) { err = e; }
+      await new Promise((res) => setTimeout(res, 1500 * (tries + 1)));
+    }
+    if (err || !r || !r.ok) throw new Error(`Couldn't upload ${f.name}${r ? ` (${r.status})` : ""}. Nothing was sent.`);
+    parts.push(await r.json()); onPart?.(n / c.parts);
+  }
+  return { ...(await api(`/api/drops/${c.id}/complete`, { method: "POST", body: JSON.stringify({ parts }) })), id: c.id };
+}
+// links made for a send that then did not go (its "send anyway?" declined): their files are deleted now, not kept 30 days for nothing
+const dropForget = (links) => { for (const l of links || []) if (l && l.id) api(`/api/drops/${l.id}`, { method: "DELETE" }).catch(() => {}); };
+function dropBlock(links) {
+  if (!links.length) return "";
+  const until = new Date(links[0].expires_at).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+  return `\n\n${links.length > 1 ? "Large files" : "Large file"} (download until ${until}):\n` + links.map((l) => `${l.name} (${sizeWord(l.size)}): ${l.url}`).join("\n");
+}
+// The files a send carries: what fits goes attached; the biggest of the rest are uploaded and go as links (the text gets dropBlock).
+// `files`: the list taken when Send was pressed, before any wait: the box may hold another conversation's by the time the
+// send checks are answered.
+async function filesForSend(files, from, body = "") {
+  const big = bigFilesOf(files, from, body), links = [];
+  const attachments = [];
+  try {
+    for (const f of files.filter((x) => big.has(x))) { toast(`Uploading ${f.name}…`, 600000); links.push(await dropUpload(f, (p) => toast(`Uploading ${f.name}… ${Math.round(p * 100)}%`, 600000))); }
+    for (const f of files.filter((x) => !big.has(x))) attachments.push({ filename: f.name, type: f.type || "application/octet-stream", content: await fileToB64(f) });
+  } catch (e) { dropForget(links); throw e; }   // the ones already up go again: nothing was sent
+  return { attachments, links };
+}
+// ---------- link previews ----------
+// As Apple Mail's rich links: a link on a line of its own in what you write (not in the quoted or forwarded mail) shows its page's
+// picture, title and description under the box, read by the hub (index.js unfurl); × takes one off. Sent, the mail carries each as a
+// card in its HTML part (the text part keeps the link as written). Its picture is the page's own https address, as any card is.
+const LPV_RX = /^\s*(https?:\/\/[^\s<>"']{4,2000})\s*$/;
+const lpvCache = new Map(), lpvGone = { c: new Set(), r: new Set() }, lpvSeq = { c: 0, r: 0 };
+const lpvLinks = (text) => [...new Set(ownText(text).split("\n").map((l) => (LPV_RX.exec(l) || [])[1]).filter(Boolean))].slice(0, 3);
+async function lpvOf(u) {
+  const c = lpvCache.get(u); if (c !== undefined) return c;
+  const p = api("/api/unfurl?u=" + encodeURIComponent(u)).then((j) => j.preview || null).catch(() => null);
+  lpvCache.set(u, p); const v = await p; lpvCache.set(u, v); if (lpvCache.size > 200) lpvCache.delete(lpvCache.keys().next().value); return v;
+}
+const lpvBox = (w) => $(w === "c" ? "#ctext" : "#rtext");
+function lpvStrip(w) { const ta = lpvBox(w); let el = ta.parentElement.querySelector(":scope > .lpv"); if (!el) { el = document.createElement("div"); el.className = "lpv"; ta.after(el); } return el; }
+async function lpvRefresh(w) {
+  const seq = ++lpvSeq[w], links = lpvLinks(lpvBox(w).value).filter((u) => !lpvGone[w].has(u));
+  const got = (await Promise.all(links.map(lpvOf))).map((p, i) => p && { ...p, url: links[i] }).filter(Boolean);
+  if (seq !== lpvSeq[w]) return;
+  const el = lpvStrip(w);
+  el.innerHTML = got.map((p) => `<div class="lpc" data-u="${esc(p.url)}">${p.image ? `<img src="${esc(proxied(p.image, 0))}" alt="" loading="lazy" decoding="async">` : ""}<div class="lpt"><div class="lps">${esc(p.site)}</div><div class="lph">${esc(p.title)}</div>${p.description ? `<div class="lpd">${esc(p.description)}</div>` : ""}</div><button type="button" class="ghost icon" data-lpx title="Send without this preview">${ico("close")}</button></div>`).join("");
+  el.querySelectorAll("[data-lpx]").forEach((b) => b.onclick = (e) => { e.preventDefault(); lpvGone[w].add(b.closest(".lpc").dataset.u); lpvRefresh(w); });
+}
+function lpvReset(w) { lpvGone[w].clear(); lpvSeq[w]++; const el = lpvBox(w)?.parentElement?.querySelector(":scope > .lpv"); if (el) el.innerHTML = ""; }
+// the previews a send carries: the links still on lines of their own, not taken off, whose page answered
+const lpvFor = (w, text) => lpvLinks(text).filter((u) => !lpvGone[w].has(u)).map((u) => { const p = lpvCache.get(u); return p && !(p instanceof Promise) ? { ...p, url: u } : null; }).filter(Boolean);
+function lpvCard(p) {
+  const font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:520px;margin:8px 0;border:1px solid #e5e5e5;border-radius:10px;border-collapse:separate"><tr><td style="padding:0">`
+    + `<a href="${esc(p.url)}" style="text-decoration:none;color:inherit;display:block">`
+    + (p.image ? `<img src="${esc(p.image)}" alt="" width="520" style="display:block;width:100%;max-width:520px;height:auto;border:0;border-radius:10px 10px 0 0">` : "")
+    + `<div style="padding:10px 14px 12px;font-family:${font}"><div style="color:#8a8a8a;font-size:12px">${esc(p.site)}</div><div style="color:#111;font-size:15px;font-weight:600;margin:2px 0 3px">${esc(p.title)}</div>`
+    + (p.description ? `<div style="color:#555;font-size:13px;line-height:1.4">${esc(p.description)}</div>` : "") + `</div></a></td></tr></table>`;
+}
+function withPreviews(d, previews) {
+  if (!previews.length || !d.text) return d;
+  const by = new Map(previews.map((p) => [p.url, p]));
+  if (d.html) {   // Markdown: a paragraph that is the link alone becomes its card
+    let h = d.html;
+    for (const [u, p] of by) { const eu = esc(u).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); h = h.replace(new RegExp(`<p>\\s*(?:<a\\b[^>]*href="${eu}"[^>]*>[^<]*</a>|${eu})\\s*</p>`), () => lpvCard(p)); }   // a function: "$&" in a title is text
+    return { ...d, html: h };
+  }
+  let out = "", quote = [];
+  const flush = () => { if (quote.length) { out += `<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex;color:#555">${quote.map((l) => linkText(l.replace(/^>\s?/, ""))).join("<br>")}</blockquote>`; quote = []; } };
+  for (const l of d.text.split("\n")) { if (/^>/.test(l)) { quote.push(l); continue; } flush(); const m = LPV_RX.exec(l); out += m && by.has(m[1]) ? lpvCard(by.get(m[1])) : `${linkText(l)}<br>`; }
+  flush();
+  return { ...d, html: `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5">${out}</div>` };
+}
+for (const w of ["c", "r"]) { let tm = null; lpvBox(w)?.addEventListener("input", () => { clearTimeout(tm); tm = setTimeout(() => lpvRefresh(w), 600); }); }
+// ---------- checks before a send ----------
+// Apple Mail's missed-recipient and attachment alerts. Before anything goes, the words you typed (above any quoted or forwarded
+// message) are read for two slips: a file you say is attached when none is, and someone you greet or say you are copying who is not on
+// the email. A name counts as on it when a recipient's name or address carries it; a greeted name is only raised when your contacts
+// know someone by it (so a "Hi Bob" to robert@ is not), a "cc'ing Dana" whether they do or not. The compose window can add the person
+// in the same step.
+const OWN_CUT = /^\s*On\b[^\n]{0,200}\bwrote:\s*$|^-{5,}\s*Forwarded message|^>/m;
+const ownText = (text) => { const s = String(text || ""), i = s.search(OWN_CUT); return i >= 0 ? s.slice(0, i) : s; };
+const ATTACH_SAID = /\b(?:i(?:'ve|’ve| have)? attached|i(?:'m|’m| am) attaching|attached (?:is|are|you(?:'ll|’ll| will) find|please find|herewith|here)|see (?:the )?attach(?:ed|ment)|please find (?:the )?(?:attach(?:ed|ment)|enclosed)|find attached|(?:is|are) attached|attached (?:file|document|pdf|invoice|copy|photo|picture|image|spreadsheet|resume|report|form|contract|quote|deck|slides)|(?:resume|invoice|file|document|pdf|photos?|pictures?|screenshots?|report|copy|contract|quote|form|spreadsheet|slides|deck|receipt|agenda|draft|list|schedule) (?:is |are )?attached|enclosed (?:is|are|please find)|i(?:'ve|’ve| have) enclosed)\b/i;
+const GREET = /^(?:hi|hey|hello|dear|hiya|howdy|good (?:morning|afternoon|evening)|morning|afternoon|evening)\b[\s,]+(.{1,60}?)\s*[,:!.—–-]*\s*$/i;
+const NOT_NAME = new Set(["all", "everyone", "everybody", "team", "guys", "folks", "there", "both", "you", "again", "friends", "yall", "y'all", "gang", "sir", "madam", "sirs", "and", "to", "of", "all,"]);
+const NAME_RX = /^\p{Lu}[\p{L}'’-]+$/u;
+const MENTION = /(?:^|[^\p{L}])([Cc][Cc](?:'|’)?(?:ing|d|ed)?|CC(?:'|’)?(?:ING|D)?|[Ll]ooping in|[Ll]oop(?:ed)? in|[Cc]opying|[Cc]opied|[Rr]oping in|[Bb]ringing in|[Aa]dding|[Aa]dded|[Ii]ncluding|[Ii]ncluded)\s+(\p{Lu}[\p{L}'’-]+)(?:\s+(?:and|&)\s+(\p{Lu}[\p{L}'’-]+))?/gu;
+const STRONG_MENTION = /^(?:cc|loop|copy|copie|roping|bringing)/i;
+function greetedNames(own) {
+  const line = (own.split("\n").find((l) => l.trim()) || "").trim(); const m = GREET.exec(line); if (!m) return [];
+  return m[1].split(/\s*(?:,|&|\band\b|\+)\s*/i).map((w) => w.trim().replace(/^(?:mr|mrs|ms|dr)\.?\s+/i, "").split(/\s+/)[0]).filter((w) => w && NAME_RX.test(w) && !NOT_NAME.has(lc(w)));
+}
+const nameWords = (n) => lc(n || "").split(/[\s,.'"()’-]+/).filter(Boolean);
+// The usual short forms, both ways: "Hi Bob" to robert@ is Robert.
+const NICKS = "robert bob rob bobby robbie|william bill will billy liam|michael mike mick mikey|james jim jimmy jamie|richard rick rich richie dick|thomas tom tommy|joseph joe joey|charles charlie chuck|christopher chris|daniel dan danny|matthew matt|anthony tony|steven stephen steve|edward ed eddie ted|elizabeth liz beth lizzie betsy eliza|katherine catherine kathryn kate kathy katie cathy kat|margaret maggie meg peggy|jennifer jen jenny|patricia pat patty trish|samuel samantha sam|alexander alexandra sam xander lexi|benjamin ben|nicholas nick|jonathan john jon johnny jack|andrew andy drew|timothy tim|gregory greg|jeffrey jeff|kenneth ken kenny|ronald ron|donald don|douglas doug|gerald jerry|lawrence larry|leonard leo len|peter pete|philip phillip phil|raymond ray|zachary zach zack|joshua josh|nathaniel nathan nate|deborah deb debbie|susan sue susie|rebecca becky becca|victoria vicky tori|jessica jess|abigail abby|christina tina|frederick fred freddie|harold harry hal|henry hank|albert al|alan allen al|isabel isabella izzy bella|madeline madison maddie|theodore theo ted teddy|vincent vince|walter walt|eugene gene|francis frank|franklin frank|joanne jo|josephine jo josie|melissa mel|melanie mel|natalie nat|nicole nikki|pamela pam|sandra sandy|stephanie steph|valerie val|veronica ronnie";
+const NICK = new Map(); for (const g of NICKS.split("|")) { const ws = g.split(" "); for (const w of ws) NICK.set(w, new Set([...(NICK.get(w) || []), ...ws])); }
+const sameName = (w, n) => w === n || (w.length > n.length && w.startsWith(n)) || !!NICK.get(n)?.has(w);
+const carriesName = (r, n) => [...nameWords(r.name), ...r.addr.split("@")[0].split(/[._+-]/)].some((w) => sameName(w, n));
+function sendSlips({ text, recips, files }) {
+  const own = ownText(text), out = { attach: null, people: [] };
+  if (!files) { const m = ATTACH_SAID.exec(own); if (m) { const a = Math.max(own.lastIndexOf("\n", m.index), ...[".", "!", "?"].map((c) => own.lastIndexOf(c, m.index))) + 1, z = own.slice(m.index + m[0].length).search(/[.!?\n]/); out.attach = own.slice(a, z < 0 ? undefined : m.index + m[0].length + z).trim().slice(0, 80); } }   // the sentence it is in
+  const book = contactsReady(), myNames = new Set([...(state.me?.identities || []).map((i) => i.name), ...(state.gmail || []).map((g) => g.name || g.label)].flatMap(nameWords));
+  const named = (r) => ({ ...r, name: r.name || book.find((c) => c.addr === r.addr)?.name || "" });
+  const rs = recips.map(named);
+  const said = [...greetedNames(own).map((n) => ({ n, how: "greet" }))];
+  for (const m of own.matchAll(MENTION)) for (const n of [m[2], m[3]].filter(Boolean)) said.push({ n, how: STRONG_MENTION.test(m[1]) ? "cc" : "add", verb: m[1] });
+  const seen = new Set();
+  for (const { n, how, verb } of said) {
+    const k = lc(n); if (seen.has(k) || NOT_NAME.has(k) || myNames.has(k) || rs.some((r) => carriesName(r, k))) continue; seen.add(k);
+    const c = book.find((x) => !isMine(x.addr) && !NOREPLY_RE.test(x.addr) && carriesName(x, k));
+    if (c || how === "cc") out.people.push({ name: n, contact: c || null, how, verb });
+  }
+  return out;
+}
+// true: send. false: back to the message. `add(list)` puts the people found into the message's own fields (compose only).
+async function sendChecks({ text, recips, files, add = null }) {
+  if (!recips.length || recips.every((r) => isMine(r.addr))) return true;
+  if (!contactBook.list) { contactsReady(); await Promise.race([contactBook.building, new Promise((r) => setTimeout(r, 400))]); }   // who a greeted name is
+  const s = sendSlips({ text, recips, files }); if (!s.attach && !s.people.length) return true;
+  const lines = [];
+  if (s.attach) lines.push(`You mention an attachment (“${s.attach}”), but nothing is attached.`);
+  for (const p of s.people) lines.push(p.how === "greet" ? `You greet ${p.name}, but ${p.contact.name || p.name} (${p.contact.addr}) is not on this email.` : p.contact ? `You wrote “${p.verb} ${p.name}”, but ${p.contact.name || p.name} (${p.contact.addr}) is not on this email.` : `You wrote “${p.verb} ${p.name}”, but no one named ${p.name} is on this email.`);
+  const addable = add ? s.people.filter((p) => p.contact) : [];
+  const v = await ask(lines.join("\n"), { ok: "Send anyway", cancel: "Go back", alt: addable.length && !s.attach ? `Add ${addable.map((p) => p.name).join(" and ")} and send` : "" });
+  if (v === "alt") { add(addable); return true; }
+  return v === true;
+}
 async function queueSend(args) {
   if (state.maybeSent && !(await ask("A message may already have gone out once (the server's answer was lost). Send this one anyway?", { ok: "Send anyway", danger: true }))) return null;   // the message stays where it is, unsent
   state.maybeSent = null;
@@ -4339,27 +4879,36 @@ async function queueSend(args) {
 // conversation and started its reply, which this used to wipe (found in October 2026 by test/audit.py: 3 s on the test machine).
 function resetReplyBox(key, sentText) {
   if (state.cur !== key || ($("#rtext").value || "").trim() !== String(sentText || "").trim()) return;
-  $("#rtext").value = ""; clearFiles($("#rfiles")); $("#rall").checked = false; $("#rprev").style.display = "none"; setTimeout(offerUnsent, 5600);
+  $("#rtext").value = ""; clearFiles($("#rfiles")); $("#rall").checked = false; $("#rprev").style.display = "none"; lpvReset("r"); setTimeout(offerUnsent, 5600);
 }
 async function sendReply(later) {
-  const m = state.replyTo, t = state.threads.get(state.cur); if (!m || !t) return; const text = $("#rtext").value.trim();   // blank is allowed: Send sends
+  const m = state.replyTo, t = state.threads.get(state.cur); if (!m || !t) return; const typedText = $("#rtext").value.trim(); let text = typedText;   // blank is allowed: Send sends
   // The reply box's draft, held from here: whatever the box holds after the awaits below may already be another conversation's.
   const dh = editors.r;
-  const from = lc($("#rfrom").value), from_name = $("#rname").value; const all = $("#rall").checked; const attachments = await filesOf($("#rfiles"));
+  const from = lc($("#rfrom").value), from_name = $("#rname").value; const all = $("#rall").checked;
+  const rto = m.out ? parseAddrList(m.to) : [{ addr: addrOf(m.replyTo || m.fromAddr), name: m.replyTo ? nameOf(m.replyTo) : nameOf(m.from) }];
+  const recips = [...rto, ...(all ? parseAddrList(`${m.to || ""}, ${m.cc || ""}`) : [])].filter((r) => r.addr && r.addr !== from);
+  const filesNow = [...($("#rfiles").files || [])];   // taken before the checks' wait: the box may be another conversation's after it
+  if (!(await sendChecks({ text, recips, files: filesNow.length > 0 }))) return;
+  if (editors.r !== dh || state.cur !== t.key || state.replyTo !== m) return toast("You moved to another conversation while the warning was open. Nothing was sent.", 8000);
+  let attachments, links;
+  const size = sendBodySize(text + (m ? quote(m) : ""), $("#rmd").checked, lpvFor("r", text));   // as it will be sent
+  try { $("#rsend").disabled = true; ({ attachments, links } = await filesForSend(filesNow, from, size)); } catch (e) { $("#rsend").disabled = false; return toast(e.message || "Couldn't upload the large file. Nothing was sent.", 8000); }
+  if (links.length) { text += dropBlock(links); toast(links.length > 1 ? `${links.length} large files go as links` : `${links[0].name} goes as a link`); }
   try {
     $("#rsend").disabled = true;
     const isGmailFrom = t.kind === "gmail" && state.gmail.some((x) => x.email === from);
     if (isGmailFrom) {
       const to = m.out ? splitAddrs(m.to) : [m.replyTo || m.fromAddr]; const cc = all ? [...splitAddrs(m.to), ...splitAddrs(m.cc)].filter((a) => addrOf(a) !== from && !to.includes(a)) : [];
-      const draft = withFormat({ from, from_name, to, cc, subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""), text: text + quote(m), attachments, ...replyHeaders(m), threadId: t.id, messageId: `${uuid4()}@mail.gmail.com` }, $("#rmd").checked);
-      if (later) return pickTime("Send at", async (due) => { await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: from, due_at: due.toISOString(), draft: { raw: buildMime(draft), threadId: t.id, subject: draft.subject, to: draft.to.join(", ") } }) }); toast("Scheduled"); draftSent(dh); resetReplyBox(t.key, text); closeReplySheet(); });
-      if (!(await queueSend({ gmail: from, draft, typed: text, threadKey: t.key, archiveKey: sendReply.archive ? t.key : null, draftId: dh.id || undefined }))) return; draftSent(dh); resetReplyBox(t.key, text); closeReplySheet(); focusAdvanceAfterSend(t.key); return;
+      const draft = withPreviews(withFormat({ from, from_name, to, cc, subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""), text: text + quote(m), attachments, ...replyHeaders(m), threadId: t.id, messageId: `${uuid4()}@mail.gmail.com` }, $("#rmd").checked), lpvFor("r", text));
+      if (later) return pickTime("Send at", async (due) => { await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: from, due_at: due.toISOString(), draft: { raw: buildMime(draft), threadId: t.id, subject: draft.subject, to: draft.to.join(", ") } }) }); toast("Scheduled"); draftSent(dh); resetReplyBox(t.key, typedText); closeReplySheet(); });
+      if (!(await queueSend({ gmail: from, draft, typed: text, threadKey: t.key, archiveKey: sendReply.archive ? t.key : null, draftId: dh.id || undefined }))) { dropForget(links); return; } draftSent(dh); resetReplyBox(t.key, typedText); closeReplySheet(); focusAdvanceAfterSend(t.key); return;
     }
-    const hubDraft = withFormat({ text, mode: all ? "all" : "one", from, from_name, attachments, plain: noLetterhead("#rfrom") }, $("#rmd").checked);
+    const hubDraft = withPreviews(withFormat({ text, mode: all ? "all" : "one", from, from_name, attachments, plain: noLetterhead("#rfrom") }, $("#rmd").checked), lpvFor("r", text));
     // Send later builds the reply as Send now does: Markdown applied, and reply-all without your own addresses or the To people again
     // (it went out as raw markdown, Cc'd you, and doubled the To list into Cc on a reply to your own message;
-    if (later) return pickTime("Send at", async (due) => { const to = m.out ? splitAddrs(m.to) : [m.replyTo || m.fromAddr]; const toSet = new Set(to.map(addrOf)); const cc = all ? [...new Set((m.out ? splitAddrs(m.cc) : [...splitAddrs(m.to), ...splitAddrs(m.cc)]).filter((a) => !toSet.has(addrOf(a)) && !isMine(addrOf(a))))] : []; const draft = withFormat({ from, from_name, to, cc, subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""), text, in_reply_to: m.msgIdHdr, attachments, plain: noLetterhead("#rfrom") }, $("#rmd").checked); await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: "hub", due_at: due.toISOString(), draft }) }); toast("Scheduled"); draftSent(dh); resetReplyBox(t.key, text); closeReplySheet(); });
-    if (!(await queueSend({ replyTo: m.id, draft: hubDraft, threadKey: t.key, archiveKey: sendReply.archive ? t.key : null, draftId: dh.id || undefined }))) return; draftSent(dh); resetReplyBox(t.key, text); closeReplySheet(); focusAdvanceAfterSend(t.key);
+    if (later) return pickTime("Send at", async (due) => { const to = m.out ? splitAddrs(m.to) : [m.replyTo || m.fromAddr]; const toSet = new Set(to.map(addrOf)); const cc = all ? [...new Set((m.out ? splitAddrs(m.cc) : [...splitAddrs(m.to), ...splitAddrs(m.cc)]).filter((a) => !toSet.has(addrOf(a)) && !isMine(addrOf(a))))] : []; const draft = withFormat({ from, from_name, to, cc, subject: /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || ""), text, in_reply_to: m.msgIdHdr, attachments, plain: noLetterhead("#rfrom") }, $("#rmd").checked); await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: "hub", due_at: due.toISOString(), draft }) }); toast("Scheduled"); draftSent(dh); resetReplyBox(t.key, typedText); closeReplySheet(); });
+    if (!(await queueSend({ replyTo: m.id, draft: hubDraft, threadKey: t.key, archiveKey: sendReply.archive ? t.key : null, draftId: dh.id || undefined }))) { dropForget(links); return; } draftSent(dh); resetReplyBox(t.key, typedText); closeReplySheet(); focusAdvanceAfterSend(t.key);
   } catch (e) { toast(e.message); } finally { $("#rsend").disabled = false; }
 }
 const quote = (m) => `\n\nOn ${new Date(m.date).toLocaleString()}, ${m.from} wrote:\n` + plainOf(m).split("\n").map((l) => "> " + l).join("\n");
@@ -4458,7 +5007,7 @@ async function sendCompose(later) {
   const from = lc($("#cfrom").value), from_name = $("#cname").value, to = splitAddrs($("#cto").value), cc = splitAddrs($("#ccc").value), bcc = splitAddrs($("#cbcc").value), subject = $("#csub").value, text = $("#ctext").value;
   if (!from || !to.length) return toast("From and To are required");
   const dh = editors.c;   // this window's draft, held across the awaits below
-  const attachments = await filesOf($("#cfiles"));
+  const filesNow = [...($("#cfiles").files || [])];   // taken now: the window may hold another message once the checks are answered
   const isGmail = state.gmail.some((x) => x.email === from && x.status === "active");
   // A hub forward: the hub adds the forwarded block and the original's files itself, so only the note above the block is sent (the
   // block went out twice). Bcc and the Markdown note go with it, and Send later schedules the same forward (it was a plain send
@@ -4468,21 +5017,30 @@ async function sendCompose(later) {
   // text now in the box: the hub still adds the original's files to a hub forward, and nothing else of the original goes.
   const fwd = state.fwd || null, at = fwd ? text.indexOf(FWD_MARK) : -1;
   const asIs = !!fwd && at >= 0 && text.slice(at).trim() === String(fwd.block || "").trim();
-  const note = at >= 0 ? text.slice(0, at).replace(/\s+$/, "") : text;
+  let note = at >= 0 ? text.slice(0, at).replace(/\s+$/, "") : text;
   const hubFwd = fwd && fwd.t.kind === "hub" && !isGmail ? fwd.m.id : null;
-  const body = hubFwd && asIs ? note : text;
+  let body = hubFwd && asIs ? note : text;
   const rich = async (d) => (fwd && asIs && !hubFwd ? forwardDraft(d, fwd, note, $("#cmd").checked) : hubFwd && !asIs ? { ...d, as_typed: true } : d);
+  const recips = parseAddrList([...to, ...cc, ...bcc].join(", "));
+  const addPeople = (ps) => { if (editors.c !== dh || !$("#cmodal").classList.contains("on")) return; for (const p of ps) { const id = p.how === "greet" ? "#cto" : "#ccc"; const f = $(id), list = splitAddrs(f.value); list.push(p.contact.addr); f.value = list.join(", "); (p.how === "greet" ? to : cc).push(p.contact.addr); } };
+  if (!(await sendChecks({ text: fwd && at >= 0 ? note : text, recips, files: filesNow.length > 0 || !!fwd, add: addPeople }))) return;
+  if (editors.c !== dh || !$("#cmodal").classList.contains("on")) return toast("The message changed while the warning was open. Nothing was sent.", 8000);
+  let attachments, links;
+  // the room is what the text and HTML this send will carry leave: built here as they will be, previews and Markdown in
+  const size = sendBodySize(body + "\n" + dropBlock([{ name: "x", size: 0, url: "https://x", expires_at: new Date().toISOString() }]), $("#cmd").checked, fwd ? [] : lpvFor("c", body));
+  try { $("#csend").disabled = true; ({ attachments, links } = await filesForSend(filesNow, from, size)); } catch (e) { $("#csend").disabled = false; return toast(e.message || "Couldn't upload the large file. Nothing was sent.", 8000); }
+  if (links.length) { const blk = dropBlock(links); note += blk; body = hubFwd && asIs ? note : at >= 0 ? text.slice(0, at).replace(/\s+$/, "") + blk + "\n\n" + text.slice(at) : text + blk; toast(links.length > 1 ? `${links.length} large files go as links` : `${links[0].name} goes as a link`); }
   try {
     $("#csend").disabled = true;
     if (later) return pickTime("Send at", async (due) => {
-      const fd = await rich(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom") }, $("#cmd").checked)); const draft = isGmail ? { raw: buildMime(fd), subject, to: to.join(", ") } : hubFwd ? { ...fd, forward_of: hubFwd } : fd;
+      const fd = await rich(withPreviews(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom") }, $("#cmd").checked), fwd ? [] : lpvFor("c", body))); const draft = isGmail ? { raw: buildMime(fd), subject, to: to.join(", ") } : hubFwd ? { ...fd, forward_of: hubFwd } : fd;
       await api("/api/schedule", { method: "POST", body: JSON.stringify({ kind: "send_later", account: isGmail ? from : "hub", due_at: due.toISOString(), draft }) }); toast("Scheduled"); const same = editors.c === dh; draftSent(dh); if (same) finishCompose(); offerUnsent();
     });
     const md = $("#cmd").checked;
-    const draft = await rich(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom"), messageId: isGmail ? `${uuid4()}@mail.gmail.com` : undefined }, md));
+    const draft = await rich(withPreviews(withFormat({ from, from_name, to, cc, bcc, subject, text: body, attachments, plain: noLetterhead("#cfrom"), messageId: isGmail ? `${uuid4()}@mail.gmail.com` : undefined }, md), fwd ? [] : lpvFor("c", body)));
     const dId = dh.id || undefined;
     const row = hubFwd ? await queueSend({ forwardOf: hubFwd, draft, typed: text, draftId: dId }) : await queueSend({ gmail: isGmail ? from : null, draft, draftId: dId });
-    if (!row) return;   // "send anyway?" declined: the message stays open as it was (it was emptied;
+    if (!row) { dropForget(links); return; }   // "send anyway?" declined: the message stays open as it was (it was emptied;
     // The queue holds the message now; undo or a failure puts it back in Drafts. The window is emptied only if it is still this one: one
     // closed meanwhile, and another opened, keeps what is being written in it.
     const same = editors.c === dh; draftSent(dh);
@@ -4493,7 +5051,7 @@ async function sendCompose(later) {
 }
 // The compose window after its message went (or was scheduled): emptied, then closed through its layer, so the next back press is not
 // spent on a window that is already gone (it was only hidden;
-function finishCompose() { clearTimeout(editors.c.timer); editors.c = newHandle("c"); draftStat(editors.c, ""); $("#cto").value = $("#ccc").value = $("#cbcc").value = $("#csub").value = $("#ctext").value = ""; clearFiles($("#cfiles")); $("#cprev").style.display = "none"; state.fwd = null; if (!dropLayer("compose")) $("#cmodal").classList.remove("on"); }
+function finishCompose() { lpvReset("c"); clearTimeout(editors.c.timer); editors.c = newHandle("c"); draftStat(editors.c, ""); $("#cto").value = $("#ccc").value = $("#cbcc").value = $("#csub").value = $("#ctext").value = ""; clearFiles($("#cfiles")); $("#cprev").style.display = "none"; state.fwd = null; if (!dropLayer("compose")) $("#cmodal").classList.remove("on"); }
 // Closing the compose window by hand (X, back, Esc) with a message in it keeps the message: the toast's Reopen puts it back as it
 // was, files included. It was discarded with no way back.
 const composeWork = () => ["#csub", "#cto", "#ccc", "#cbcc"].some((k) => ($(k).value || "").trim()) || (($("#ctext").value || "").trim() && $("#ctext").value.trim() !== sigFor($("#cfrom").value || "").trim()) || $("#cfiles").files.length > 0;
@@ -4573,10 +5131,12 @@ function draftChain(id, fn) { const prev = draftStore.chains.get(id) || Promise.
 // Files go up once each, under the handle's draft. One that cannot go up now is kept on this device, its bytes in IndexedDB, and named
 // as pending on the draft; the retry sends it and reopening the draft brings it back.
 // One the hub refuses for good (over 18 MB a draft) is counted, not kept.
+const DRAFT_FILE_KEEP = 18 * 1048576;   // the hub's DRAFT_FILES_MAX: a file over it is never sent to the draft at all
 async function draftUpload(h, files) {
   const refs = [], pending = []; let refused = 0;
   for (const f of files) {
     const k = draftFileKey(f); let u = h.up.get(k);
+    if (f.size > DRAFT_FILE_KEEP) { refused++; continue; }   // too big to keep with the draft: it stays in the box and goes as a link at Send
     if (!u || u.draftId !== h.id) {
       try { u = { draftId: h.id, ref: await api(`/api/drafts/${h.id}/files`, { method: "POST", body: f, headers: { "content-type": f.type || "application/octet-stream", "x-file-name": encodeURIComponent(f.name) } }) }; h.up.set(k, u); idb.del("meta", draftBlobKey(h.id, k)).catch(() => {}); }
       catch (e) { if (e.status === 413) { refused++; continue; } pending.push({ k, name: f.name, type: f.type || "", size: f.size, lastModified: f.lastModified }); try { await idb.meta(draftBlobKey(h.id, k), { name: f.name, type: f.type || "", lastModified: f.lastModified, bytes: await f.arrayBuffer() }); } catch (_) {} continue; }   // bytes, not the File: WebKit refuses a Blob in IndexedDB (the put fails, logged only)
@@ -5153,6 +5713,8 @@ async function openSettings(want, o = {}) {
       + sGroup("Per account", accountsAll().map((a) => sRow(esc(a.label), sel("", [["", "Same as above"], ["all", "All new mail"], ["smart", "Smart"], ["priority", "Priority only"], ["none", "Nothing"]], (p.notifyByAccount || {})[a.id] || "", `data-notify="${esc(a.id)}" aria-label="Notifications for ${esc(a.label)}"`))).join(""), { hint: "Overrides the choice above for one account." })
       + (subs.subscriptions.length ? sGroup(`Registered devices (${subs.subscriptions.length})`, subs.subscriptions.map((x) => sRow(x.id === mineId ? "This device" : esc((x.ua || "Unknown device").slice(0, 60)), "", `${x.last_ok_at ? "Last push delivered " + esc(x.last_ok_at.slice(0, 16).replace("T", " ")) : "No push delivered yet"}${x.fail_count ? ` · <span style="color:var(--danger)">${x.fail_count} consecutive failures</span>` : ""}${x.last_error ? " · " + esc(String(x.last_error).slice(0, 60)) : ""}`)).join("")) : ""),
     inbox: sGroup("New senders", sToggle("gk", p.gatekeeper === "top", "Screen first-time senders", "They wait above the inbox until you accept them. Off: they arrive like normal mail with a “new” tag."))
+      + sGroup("Logos", sToggle("lgs", p.logos !== false, "Show company logos", "Business mail shows the sender's logo instead of a letter. The hub finds each one once and keeps it; the sender never sees you look."))
+      + sGroup("Follow up", sToggle("fus", p.followUps !== false, "Bring back mail that got no reply", "Mail you sent that asks something comes back above the inbox after 3 days without an answer, until you reply or press Done."))
       + sGroup("Grouping", sToggle("grp", !!p.groupSenders, "Group Notifications and Newsletters by sender")),
     swipes: sGroup("Swipe actions", SWIPE_SLOTS.map(([id, key, side, len, right, long]) => { const a = p.swipes[key]; const c = swipeColor(a, right, long);
         return `<div class="st-row"><div class="st-rl st-swl">${swipeGlyph(right, long, c)}<div class="st-rt">${side.replace("Swipe r", "R").replace("Swipe l", "L")} <span style="color:var(--mut)">·</span> ${len}</div></div><div class="st-rc"><label class="st-pick" style="--c:${c}">${ico(ACTION_ICONS[a] || "close")}<select class="f" id="${id}" aria-label="${side}, ${len}">${opt(id, a)}</select></label></div></div>`; }).join(""),
@@ -5294,6 +5856,8 @@ async function openSettings(want, o = {}) {
   $("#notifyPreview").onchange = () => setPref("notifyPreview", $("#notifyPreview").value).then(() => toast("Notifications will show: " + $("#notifyPreview").selectedOptions[0].textContent.toLowerCase()));
   $("#gk").onchange = () => setPref("gatekeeper", $("#gk").checked ? "top" : "off").then(render);
   $("#grp").onchange = () => setPref("groupSenders", $("#grp").checked).then(render);
+  $("#fus").onchange = () => setPref("followUps", $("#fus").checked).then(render);
+  $("#lgs").onchange = () => { prerendered.clear(); return setPref("logos", $("#lgs").checked).then(render); };
   $("#chrome").onchange = () => setPref("openInChrome", $("#chrome").checked).then(() => toast($("#chrome").checked ? "Links open in Chrome" : "Links open in the in-app tab"));
   $$("[data-sig]").forEach((ta) => ta.onchange = () => setPref("signatures", { ...prefs().signatures, [ta.dataset.sig]: ta.value }));
   $("#showdupes").onchange = () => api("/api/prefs", { method: "PUT", body: JSON.stringify({ showDupes: $("#showdupes").checked }) }).then(() => { state.prefs.showDupes = $("#showdupes").checked; render(); });
@@ -5814,7 +6378,9 @@ function onFileDrop(e, el = e.target) {
   } else if (folders) toast("Folders can't be attached - drop the files inside");
 }
 window.addEventListener("dragenter", (e) => onFileDrag(e)); window.addEventListener("dragover", (e) => onFileDrag(e)); window.addEventListener("drop", (e) => onFileDrop(e));
-for (const [inp, lbl] of [["#rfiles", "#rfilesn"], ["#cfiles", "#cfilesn"]]) $(inp).addEventListener("change", () => { const n = $(inp).files.length; $(lbl).textContent = n ? `${n} file${n > 1 ? "s" : ""}` : "Attach"; }); $("#scrim").onclick = () => closeMenu();
+// the label says how many go as links, for the From picked now
+const filesLabel = (inp, lbl, fromSel) => { const fs = [...($(inp).files || [])], n = fs.length, w = inp === "#cfiles" ? "c" : "r", txt = $(w === "c" ? "#ctext" : "#rtext")?.value || "", k = n ? bigFilesOf(fs, $(fromSel)?.value, sendBodySize(w === "r" && state.replyTo ? txt + quote(state.replyTo) : txt, $(w === "c" ? "#cmd" : "#rmd")?.checked, lpvFor(w, txt))).size : 0; $(lbl).textContent = n ? `${n} file${n > 1 ? "s" : ""}${k ? ` · ${k === n ? (n > 1 ? "all as links" : "as a link") : `${k} as a link${k > 1 ? "s" : ""}`}` : ""}` : "Attach"; };
+for (const [inp, lbl, fromSel] of [["#rfiles", "#rfilesn", "#rfrom"], ["#cfiles", "#cfilesn", "#cfrom"]]) { $(inp).addEventListener("change", () => filesLabel(inp, lbl, fromSel)); $(fromSel)?.addEventListener("change", () => filesLabel(inp, lbl, fromSel)); } $("#scrim").onclick = () => closeMenu();
 window.addEventListener("online", () => { document.body.classList.remove("is-offline"); refresh({ silent: true }); }); window.addEventListener("offline", () => document.body.classList.add("is-offline"));
 // Swept twice: at once for what the page already knew, and again when the refresh has brought it up to date.
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { adoptOnResume(); refresh({ silent: true }).then(sweepNotifications, () => {}); sweepNotifications(); } });
@@ -5977,7 +6543,7 @@ async function ensureThreadLocal(acc, th) {
   bulkLogLoad();
   window.__ensureSearch = ensureSearch;   // NOT reset here: boot awaits IndexedDB first, and a search focused during that window has already started the engine
   if (queue.pending().length) { toast(`${queue.pending().length} pending action(s) resuming`); queue.kick(500); }   // loaded above, before adoption
-  scheduleIdle(backfillUnsub); scheduleIdle(() => settingsKept().then(() => settingsFetch()));   // the badge, and Settings ready to draw
+  scheduleIdle(backfillUnsub); backfillProof(); setTimeout(() => logoReport("boot"), 20000); scheduleIdle(() => settingsKept().then(() => settingsFetch()));   // the badge, and Settings ready to draw
   onBroadcast((m) => { // another window of this app: apply its local changes, pick up its queue rows, honour its recent persists
     if (m.type === "thread") { const t = state.threads.get(m.key); if (t && !((t.updatedAt || 0) > (m.patch.updatedAt || 0))) { Object.assign(t, m.patch); idb.putAll("threads", [t]); clearTimeout(onBroadcast._t); onBroadcast._t = setTimeout(() => { render(); updateBadge(); }, 60); } }
     else if (m.type === "queue") queue.load().then(() => queue.kick(200)).catch(() => {});
@@ -6020,4 +6586,4 @@ async function ensureThreadLocal(acc, th) {
 })();
 
 // debug hook (also handy in the browser console)
-window.mh = { warmPictures, forwardDraft, syncDrafts, draftStore, editors, openDraft, draftFlush, idb, openThread, openCompose, openFind, closeFind, findStep, findState: find, actedElsewhere, imgDims, syncImgDims, applyImgDims, syncTrackers, urlHash, attOpen, attDownload, attRisk, attExpect, attSniff, attView, quoteSplitText, quoteSplitHtml, THREAD_ACTIONS, actionKey, gmailDelta, adapterFor, applyLocal, plainOf, openSettings, closeSettings, openImapForm, attHref, messageHtml, fillTrustAges, ensureThreadLocal, acceptStash, importNow, primeStashes, openUrl: (url) => { const u = new URL(url, location.origin); history.replaceState(history.state, "", u.pathname + u.search); return handleParams(); }, gmailTokens, contactBook, buildContactBook, parseAddrList, update, updateSafe, checkVersion, applyUpdate, sendSpeedReport, setImgPass, proxyImages, snapshot, idb, searchMore, serverSearch, applyLocal, queueSend, ask, askText, state, refresh, render, act, isHubCopy, mirrorHubCopies, catOf, prefs, visibleThreads, openThread, setView, perf, queue, localAct, prerendered, prefetchBodies, searchIndex, ensureSearch, backfillBodyIndex, openPalette, paletteCommands, fillVars, mdToHtml, buildMime, senderRule, focusReply, openMenuFor: (t) => openMenu({ target: document.body }, t), bootstrapAll, dropRowNode, writeSnapshotNow, markSnapshotDirty, pushLive, notePushMissed, notePushDelivered, pushLayer, dropLayer, closeMenu, layers, back: backLayer, bulk, bulkUndo, selectAll, selectFromHere, setFocus, counts, backfillUnsub, UNSUB_BACKFILL, refreshRowFromBodies, cachedThread, hub, syncHub, flushDeferredDeletes, threadFor, adoptServerRow, openExternal, chromeIntent, dismissNotifications, sweepNotifications, noteHandled, flushHandled, noteEndpoint, warmEndpoint, androidApp, syncPushSubscription, myPushId, pushOptOut, setPushOptOut, pushedThread, sweepPushStash, adoptPushStashes, rowFromStash };
+window.mh = { invites: { parseIcs, inviteWhen, whenText, rsvpIcs }, warmPictures, forwardDraft, syncDrafts, draftStore, editors, openDraft, draftFlush, idb, openThread, openCompose, openFind, closeFind, findStep, findState: find, actedElsewhere, imgDims, syncImgDims, applyImgDims, syncTrackers, urlHash, attOpen, attDownload, attRisk, attExpect, attSniff, attView, quoteSplitText, quoteSplitHtml, THREAD_ACTIONS, actionKey, gmailDelta, adapterFor, applyLocal, plainOf, openSettings, closeSettings, openImapForm, attHref, messageHtml, fillTrustAges, ensureThreadLocal, acceptStash, importNow, primeStashes, openUrl: (url) => { const u = new URL(url, location.origin); history.replaceState(history.state, "", u.pathname + u.search); return handleParams(); }, gmailTokens, contactBook, buildContactBook, parseAddrList, update, updateSafe, checkVersion, applyUpdate, sendSpeedReport, setImgPass, proxyImages, snapshot, idb, searchMore, serverSearch, applyLocal, queueSend, ask, askText, state, refresh, render, act, isHubCopy, mirrorHubCopies, catOf, prefs, visibleThreads, openThread, setView, perf, queue, localAct, prerendered, prefetchBodies, searchIndex, ensureSearch, backfillBodyIndex, openPalette, paletteCommands, fillVars, mdToHtml, buildMime, senderRule, focusReply, openMenuFor: (t) => openMenu({ target: document.body }, t), bootstrapAll, dropRowNode, writeSnapshotNow, markSnapshotDirty, pushLive, notePushMissed, notePushDelivered, pushLayer, dropLayer, closeMenu, layers, back: backLayer, bulk, bulkUndo, selectAll, selectFromHere, setFocus, counts, backfillUnsub, UNSUB_BACKFILL, refreshRowFromBodies, cachedThread, hub, syncHub, flushDeferredDeletes, threadFor, adoptServerRow, openExternal, chromeIntent, dismissNotifications, sweepNotifications, noteHandled, flushHandled, noteEndpoint, warmEndpoint, androidApp, syncPushSubscription, myPushId, pushOptOut, setPushOptOut, pushedThread, sweepPushStash, adoptPushStashes, rowFromStash };

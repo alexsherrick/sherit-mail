@@ -107,6 +107,14 @@ with sync_playwright() as pw:
         want = ["https://cdn.ex.example/inline.woff2", SHEET_URL, "https://img.ex.example/a.png", "https://fonts.ex.example/linked.woff2"]
         check(sorted(warmed) == sorted(want) and warmed.index("https://cdn.ex.example/inline.woff2") < warmed.index("https://img.ex.example/a.png"),
               f"{name}: warming a mail asks for its font, its stylesheet copy and the font inside it, the font before its picture ({warmed})")
+        # the old IE pattern: `src: url(x.eot); src: url(x.eot?#iefix) format(...), url(x.woff2) format("woff2")`: the woff2 is warmed
+        page.evaluate("""() => { const P = (u) => '/api/img?u=' + encodeURIComponent(u);
+          // as proxyImages writes it: each url() unquoted, the hub address in place of the sender's
+          const doc = "<style>@font-face{font-family:'Fin';src:url(" + P("https://cdn.ie.example/fin.eot") + ");src:url(" + P("https://cdn.ie.example/fin.eot?#iefix") + ") format('embedded-opentype'),url(" + P("https://cdn.ie.example/fin.woff2") + ") format('woff2')}</style><p>x</p>";
+          window.__warm1 = window.__mock.calls.length; window.mh.warmPictures([doc]); }""")
+        page.wait_for_timeout(400)
+        ie = [parse_qs(urlparse(c.split(" ", 1)[1]).query).get("u", [""])[0] for c in page.evaluate("() => window.__mock.calls.slice(window.__warm1)") if c.startswith("GET /api/img?")]
+        check(ie == ["https://cdn.ie.example/fin.woff2"], f"{name}: a face with two src declarations is warmed from the last, its woff2, never its .eot ({ie})")
         check(not errs, f"{name}: no page errors {errs[:2]}")
         b.close()
 srv.shutdown()

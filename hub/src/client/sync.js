@@ -1,7 +1,7 @@
 /* sync.js: fills and keeps the local store current (and 4).
    Gmail: a one-time throttled fill of the sync window (messages.list newer_than + messages.get format=metadata in batches),
    then history.list deltas from a stored historyId. Hub: the thread list (all boxes). Nothing here fetches bodies. */
-const SYNC = { hubMax: 5000, windowDays: 90, batch: 20, perMinute: 120, listPage: 500, hubFullMs: 24 * 60 * 60_000, hubFullDeferMs: 30_000, mirrorPage: 1000, META: "format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Id&metadataHeaders=Precedence&metadataHeaders=Auto-Submitted&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References&metadataHeaders=List-Unsubscribe-Post" };
+const SYNC = { hubMax: 5000, windowDays: 90, batch: 20, perMinute: 120, listPage: 500, hubFullMs: 24 * 60 * 60_000, hubFullDeferMs: 30_000, mirrorPage: 1000, META: "format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Id&metadataHeaders=Precedence&metadataHeaders=Auto-Submitted&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References&metadataHeaders=List-Unsubscribe-Post&metadataHeaders=Authentication-Results" };
 const syncState = { running: new Set(), progress: {} };            // progress[email] = { phase, done, total, note }
 // Gmail's snippet is HTML-escaped. &lt; and &gt; were left in until 2026-10-05, so a preview read "Q&A &lt;&gt; Exampleco Space";
 // &amp; goes last, so an escaped "&amp;lt;" (a literal "&lt;" in the mail) is decoded once, not twice.
@@ -9,7 +9,11 @@ const gmailSnippet = (s) => String(s || "").replace(/&#39;/g, "'").replace(/&quo
 function msgMetaFromGmail(email, m) {
   const h = hmap(m); const from = h.from || ""; const labels = m.labelIds || []; const out = labels.includes("SENT");
   const hasAtt = !!(m.payload && (m.payload.parts || []).some((p) => p.filename)) || /multipart\/mixed/i.test(m.payload?.mimeType || "");
-  return { key: `${email}|${m.id}`, threadKey: `${email}|${m.threadId}`, account: email, id: m.id, threadId: m.threadId, from, fromAddr: out ? email : addrOf(from), fromName: out ? "You" : nameOf(from), to: h.to || "", cc: h.cc || "", subject: h.subject || "", date: Number(m.internalDate) || Date.parse(h.date) || 0, snippet: gmailSnippet(m.snippet), labels, cat: categorize({ headers: h, from, labels }), msgIdHdr: (h["message-id"] || "").replace(/^<|>$/g, ""), inReplyTo: h["in-reply-to"] || "", refs: h.references || "", hasAtt, size: m.sizeEstimate || 0, unsub: h["list-unsubscribe"] || "", unsubPost: h["list-unsubscribe-post"] || "" };
+  // `proven`: Gmail's own DMARC verdict proves the From, true or false; undefined for a record fetched without the
+  // header (synced before 2026-11-26), which backfillProof asks Gmail about. Without it no Gmail row could show its sender's logo.
+  const ar = ((m.payload || {}).headers || []).filter((x) => lc(x.name) === "authentication-results").map((x) => x.value);
+  const proven = out ? false : ar.length ? provenBy(ar, "mx.google.com", addrOf(from)) : undefined;
+  return { key: `${email}|${m.id}`, threadKey: `${email}|${m.threadId}`, account: email, id: m.id, threadId: m.threadId, proven, from, fromAddr: out ? email : addrOf(from), fromName: out ? "You" : nameOf(from), to: h.to || "", cc: h.cc || "", subject: h.subject || "", date: Number(m.internalDate) || Date.parse(h.date) || 0, snippet: gmailSnippet(m.snippet), labels, cat: categorize({ headers: h, from, labels }), msgIdHdr: (h["message-id"] || "").replace(/^<|>$/g, ""), inReplyTo: h["in-reply-to"] || "", refs: h.references || "", hasAtt, size: m.sizeEstimate || 0, unsub: h["list-unsubscribe"] || "", unsubPost: h["list-unsubscribe-post"] || "" };
 }
 const cooldownWait = async (email) => { for (let i = 0; i < 40 && cooldownLeft(email); i++) await sleep(Math.min(cooldownLeft(email), 5000)); };
 // Fetch a chunk, apply what arrived, and FAIL (retryably) if anything is missing: progress markers must never advance past a hole.
@@ -407,7 +411,7 @@ async function syncAccount(a, opts = {}) {
     if (gmailViaHub(a.id)) { await gmailHubMirror(a.id, { replace: "switch" }).catch(() => null); }
     return r;
   }
-  finally { syncState.running.delete(a.id); if (typeof backfillUnsub === "function") scheduleIdle(backfillUnsub); } // rows that predate the header capture learn List-Unsubscribe in the background
+  finally { syncState.running.delete(a.id); if (typeof backfillUnsub === "function") scheduleIdle(backfillUnsub); if (typeof backfillProof === "function") backfillProof(); } // rows that predate the header capture learn List-Unsubscribe in the background
 }
 // One hub sync at a time in this window, shared by every account that rides it: the hub itself and each Gmail account it mirrors.
 // A refresh defers a daily pass that only its timer made due; the deferred run (runDeferredHubFull) is the one that does it.
@@ -416,7 +420,7 @@ function syncHubShared({ deferred = false } = {}) {
   const p = (async () => {
     syncState.running.add("hub");
     try { return await withLock("sync:hub", () => syncHub({ defer: !deferred, deferred })); }
-    finally { syncState.running.delete("hub"); if (typeof backfillUnsub === "function") scheduleIdle(backfillUnsub); }
+    finally { syncState.running.delete("hub"); if (typeof backfillUnsub === "function") scheduleIdle(backfillUnsub); if (typeof backfillProof === "function") backfillProof(); }
   })();
   syncState.hubShared = p; p.finally(() => { if (syncState.hubShared === p) syncState.hubShared = null; }).catch(() => {});
   return p;

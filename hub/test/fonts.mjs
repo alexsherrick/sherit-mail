@@ -192,6 +192,9 @@ try {
   due(); const d2 = await mod.drainImgQueue(env);
   const got2 = await Promise.all(["brand-latin", "brand-bold", "unused"].map((n) => held(`https://fonts.font.example/s/${n}.woff2`)));
   check(got2.every((f) => f && f.ct === "font/woff2") && !host.asked.slice(n1).includes("https://fonts.font.example/s/brand-cyr.woff2"), `the next minute fetches them, as fonts (${JSON.stringify({ d1: d1.stored, d2: d2.stored })})`);
+  // ---------- the old IE pattern: two src declarations, the browser using the last ----------
+  const ie = mod.fontFaces(`@font-face{font-family:'Fin Display';src:url('https://cdn.font.example/fin.eot');src:url('https://cdn.font.example/fin.eot?#iefix') format('embedded-opentype'),url('https://cdn.font.example/fin.woff2') format('woff2'),url('https://cdn.font.example/fin.woff') format('woff');font-weight:300}`);
+  check(ie.length === 1 && ie[0].src === "https://cdn.font.example/fin.woff2" && ie[0].family === "fin display", `a face with two src declarations takes its font from the last, as the browser does (${JSON.stringify(ie.map((f) => f.src))})`);
 } catch (e) { check(false, "threw: " + String(e?.stack || e).split("\n").slice(0, 3).join(" | ")); }
 console.log(fails.length ? `\n${fails.length} failed` : "\nall font checks passed");
 process.exit(fails.length ? 1 : 0);

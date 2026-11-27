@@ -637,6 +637,338 @@ async function fetchImageSafely(u, max = IMG_MAX, o = {}) {
   return { ok: true, ct, len: declared, body: body.pipeThrough(counter) };
 }
 const imgKey = async (href) => "img/" + [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(href)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+// A request's body, at most `max` bytes, read as it streams: past `max` the read stops and null is returned, whatever Content-Length said
+// or did not say (a chunked body has none).
+async function bodyCapped(request, max) {
+  if (Number(request.headers.get("content-length") || 0) > max) return null;
+  if (!request.body) return new Uint8Array(0);
+  const r = request.body.getReader(), parts = []; let n = 0;
+  for (;;) { const { value, done } = await r.read(); if (done) break; n += value.byteLength; if (n > max) { try { await r.cancel(); } catch (_) {} return null; } parts.push(value); }
+  const out = new Uint8Array(n); let o = 0; for (const x of parts) { out.set(x, o); o += x.byteLength; } return out;
+}
+// ---------- big files as links ----------
+// As Apple's Mail Drop: a file too big for the way its message goes out (the hub's own sends stop at 5 MiB, the work server at 25 MiB,
+// Gmail at 25 MB) is uploaded here and the message carries a link to it, kept 30 days. The app uploads it in 8 MiB parts (an R2
+// multipart upload: each part one request, far under the Worker's body limit); whoever has the link (32 random characters) gets a page
+// with its name, size and date at /f/<token>, and the file at /f/<token>/file, ranges included. At most 2 GiB a file and 8 GiB kept in
+// all; expired files and uploads left unfinished for 8 days are deleted by the daily sweep.
+const DROP_PART = 8 * 1024 * 1024, DROP_MAX = 2 * 1024 ** 3, DROP_TOTAL = 8 * 1024 ** 3, DROP_DAYS = 30;
+async function dropsApi(request, env, path) {
+  const db = env.DB; let x;
+  if (request.method === "POST" && path === "/api/drops") {
+    const b = await request.json().catch(() => ({}));
+    const size = Number(b.size), name = String(b.name || "").replace(/[\x00-\x1f\x7f/\\]/g, " ").trim().slice(0, 200) || "file";
+    if (!Number.isSafeInteger(size) || size <= 0) return json({ error: "size is required" }, 400);
+    if (size > DROP_MAX) return json({ error: "a file over 2 GB can't be sent as a link" }, 413);
+    const id = uuid(), linkId = b64url(crypto.getRandomValues(new Uint8Array(24))), key = `drop/${id}/${safeName(name)}`;   // the link's 32 characters
+    const type = /^[\w.+-]+\/[\w.+-]+$/.test(String(b.type || "")) ? String(b.type) : "application/octet-stream";
+    const exp = new Date(Date.now() + DROP_DAYS * 864e5).toISOString(), at = now();
+    // the space is taken in the same statement that checks it, so two uploads at once cannot both pass the 8 GiB
+    const took = await db.prepare("INSERT INTO drops (id, token, filename, content_type, size, r2_key, upload_id, state, created_at, expires_at) SELECT ?, ?, ?, ?, ?, ?, NULL, 'uploading', ?, ? WHERE (SELECT COALESCE(SUM(size), 0) FROM drops WHERE expires_at > ?) + ? <= ?").bind(id, linkId, name, type, size, key, at, exp, at, size, DROP_TOTAL).run();
+    if (!took.meta?.changes) return json({ error: "the space for large files is full until older links expire" }, 507);
+    let up; try { up = await env.STORE.createMultipartUpload(key, { httpMetadata: { contentType: type } }); } catch (e) { await db.prepare("DELETE FROM drops WHERE id = ?").bind(id).run(); throw e; }   // its space back
+    await db.prepare("UPDATE drops SET upload_id = ? WHERE id = ?").bind(up.uploadId, id).run();
+    return json({ id, part: DROP_PART, parts: Math.ceil(size / DROP_PART) });
+  }
+  if ((x = path.match(/^\/api\/drops\/([0-9a-f-]{36})\/parts\/(\d{1,4})$/)) && request.method === "PUT") {
+    const row = await db.prepare("SELECT * FROM drops WHERE id = ? AND state = 'uploading'").bind(x[1]).first(); if (!row) return json({ error: "no such upload" }, 404);
+    const n = Number(x[2]), last = Math.ceil(row.size / DROP_PART); if (n < 1 || n > last) return json({ error: "no such part" }, 400);
+    const body = await bodyCapped(request, DROP_PART), want = n < last ? DROP_PART : row.size - DROP_PART * (last - 1);   // never more than a part held
+    if (!body) return json({ error: "a part is at most 8 MiB" }, 413);
+    if (body.byteLength !== want) return json({ error: `part ${n} must be ${want} bytes` }, 400);
+    const part = await env.STORE.resumeMultipartUpload(row.r2_key, row.upload_id).uploadPart(n, body);
+    return json({ partNumber: part.partNumber, etag: part.etag });
+  }
+  if ((x = path.match(/^\/api\/drops\/([0-9a-f-]{36})\/complete$/)) && request.method === "POST") {
+    const row = await db.prepare("SELECT * FROM drops WHERE id = ?").bind(x[1]).first(); if (!row) return json({ error: "no such upload" }, 404);
+    // asked again (its answer lost on the way): the same link, not an error that would strand the file
+    if (row.state === "ready") return json({ url: `${new URL(request.url).origin}/f/${row.token}`, expires_at: row.expires_at, name: row.filename, size: row.size });
+    const b = await request.json().catch(() => ({})), parts = Array.isArray(b.parts) ? b.parts.map((p) => ({ partNumber: Number(p.partNumber), etag: String(p.etag || "") })) : [];
+    if (parts.length !== Math.ceil(row.size / DROP_PART)) return json({ error: "parts missing" }, 400);
+    // R2 completes an upload once: asked again after its row missed the news (D1 failed after R2 finished), the object itself answers
+    let obj; try { obj = await env.STORE.resumeMultipartUpload(row.r2_key, row.upload_id).complete(parts.sort((a, b) => a.partNumber - b.partNumber)); }
+    catch (e) { const h = await env.STORE.head(row.r2_key).catch(() => null); if (!h) throw e; obj = h; }
+    if (obj.size !== row.size) { await env.STORE.delete(row.r2_key); await db.prepare("DELETE FROM drops WHERE id = ?").bind(row.id).run(); return json({ error: "the upload came out the wrong size" }, 400); }
+    await db.prepare("UPDATE drops SET state = 'ready', upload_id = NULL WHERE id = ?").bind(row.id).run();
+    return json({ url: `${new URL(request.url).origin}/f/${row.token}`, expires_at: row.expires_at, name: row.filename, size: row.size });
+  }
+  // a link the app made for a send that did not go: its file and row go now, not in 30 days
+  if ((x = path.match(/^\/api\/drops\/([0-9a-f-]{36})$/)) && request.method === "DELETE") {
+    const row = await db.prepare("SELECT * FROM drops WHERE id = ?").bind(x[1]).first(); if (!row) return json({ ok: true, deleted: 0 });
+    if (!(await dropGone(env, row))) return json({ error: "could not delete the file yet" }, 503);
+    await db.prepare("DELETE FROM drops WHERE id = ?").bind(row.id).run(); return json({ ok: true, deleted: 1 });
+  }
+  return null;
+}
+// The file is gone from R2: an unfinished upload aborted, else the object deleted; true only once nothing is left (a row is never
+// dropped while its bytes may still be there, or they would be kept for good with nothing to find them by).
+async function dropGone(env, r) {
+  if (r.state === "uploading" && r.upload_id) { try { await env.STORE.resumeMultipartUpload(r.r2_key, r.upload_id).abort(); } catch (_) {} }
+  try { await env.STORE.delete(r.r2_key); } catch (_) { return false; }
+  try { return !(await env.STORE.head(r.r2_key)); } catch (_) { return false; }
+}
+const fmtBytes = (n) => n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB` : n >= 1024 ** 2 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+async function dropPublic(request, env, url) {
+  const m = url.pathname.match(/^\/f\/([A-Za-z0-9_-]{32})(\/file)?$/); if (!m || !["GET", "HEAD"].includes(request.method)) return null;
+  const row = await env.DB.prepare("SELECT * FROM drops WHERE token = ? AND state = 'ready' AND expires_at > ?").bind(m[1], now()).first();
+  const page = (status, inner) => new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${inner.title}</title><style>body{margin:0;font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f4;color:#1c1917;display:flex;min-height:100vh;align-items:center;justify-content:center}main{background:#fff;border:1px solid #e7e5e4;border-radius:14px;padding:28px 28px 24px;max-width:440px;width:calc(100% - 32px);box-sizing:border-box}h1{font-size:18px;margin:0 0 6px;overflow-wrap:anywhere}p{margin:4px 0;color:#57534e;font-size:14px}a.b{display:inline-block;margin-top:18px;background:#1c1917;color:#fff;text-decoration:none;padding:10px 20px;border-radius:9px;font-weight:600}@media(prefers-color-scheme:dark){body{background:#1c1917;color:#f5f5f4}main{background:#292524;border-color:#44403c}p{color:#a8a29e}a.b{background:#f5f5f4;color:#1c1917}}</style></head><body><main>${inner.body}</main></body></html>`,
+    { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'", "x-robots-tag": "noindex" } });
+  if (!row) return page(404, { title: "Link expired", body: "<h1>This link has expired</h1><p>Large files sent as links are kept for 30 days. Ask the sender to send it again.</p>" });
+  if (!m[2]) {
+    const until = new Date(row.expires_at).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+    return page(200, { title: esc(row.filename), body: `<h1>${esc(row.filename)}</h1><p>${fmtBytes(row.size)} · available until ${until}</p><a class="b" href="/f/${row.token}/file">Download</a>` });
+  }
+  const range = /^bytes=(\d*)-(\d*)$/.exec(request.headers.get("range") || "");
+  let r2range = null, status = 200;
+  if (range && (range[1] || range[2])) {
+    const start = range[1] ? Number(range[1]) : Math.max(0, row.size - Number(range[2])), end = range[1] && range[2] ? Math.min(Number(range[2]), row.size - 1) : row.size - 1;
+    if (start > end || start >= row.size) return new Response(null, { status: 416, headers: { "content-range": `bytes */${row.size}` } });
+    r2range = { offset: start, length: end - start + 1 }; status = 206;
+  }
+  const obj = request.method === "HEAD" ? null : await env.STORE.get(row.r2_key, r2range ? { range: r2range } : undefined);
+  if (request.method !== "HEAD" && !obj) return page(404, { title: "Link expired", body: "<h1>This file is no longer here</h1>" });
+  if (!r2range && request.method === "GET") await env.DB.prepare("UPDATE drops SET downloads = downloads + 1, last_download_at = ? WHERE id = ?").bind(now(), row.id).run().catch(() => {});
+  const ascii = row.filename.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return new Response(obj ? obj.body : null, { status, headers: { "content-type": row.content_type || "application/octet-stream", "content-length": String(r2range ? r2range.length : row.size), "accept-ranges": "bytes", ...(r2range ? { "content-range": `bytes ${r2range.offset}-${r2range.offset + r2range.length - 1}/${row.size}` } : {}),
+    "content-disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(row.filename)}`, "content-security-policy": "sandbox; default-src 'none'", "cache-control": "private, max-age=3600" } });
+}
+async function sweepDrops(env) {   // the daily sweep: expired links, and uploads left unfinished for a day
+  // An unfinished upload is left 8 days: one still going (256 parts on a slow line) is never swept from under its sender,
+  // and by then R2's default rule has aborted it (unfinished multipart uploads are aborted seven days after they began).
+  const { results } = await env.DB.prepare("SELECT id, r2_key, upload_id, state FROM drops WHERE expires_at <= ? OR (state = 'uploading' AND created_at <= ?) LIMIT 200").bind(now(), new Date(Date.now() - 8 * 864e5).toISOString()).all();
+  let n = 0;
+  for (const r of results || []) if (await dropGone(env, r)) { await env.DB.prepare("DELETE FROM drops WHERE id = ?").bind(r.id).run(); n++; }   // else tried again tomorrow
+  return n;
+}
+// ---------- link previews ----------
+// As Apple Mail's rich links: a link on a line of its own in a message being written shows its page's title, description and picture,
+// and the mail carries them as a card. The hub reads the page (never the app): its head only, at most 512 KB, every host and redirect
+// checked against private addresses, kept 7 days. Open Graph first (og:title, og:description, og:image, og:site_name), then Twitter's
+// tags, then <title> and the description meta. A picture must be https. A page that is not HTML, or names nothing, has no preview.
+const UNFURL_KEEP_MS = 7 * 864e5, UNFURL_HEAD_MAX = 512 * 1024;
+async function readPage(href) {
+  let u; try { u = new URL(href); } catch (_) { return null; }
+  if (!/^https?:$/.test(u.protocol) || u.href.length > 2048 || !(await hostOk(u))) return null;
+  const g = await fetchHops(u, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5"); if (!g.up) return null;
+  if (!/html/i.test(g.up.headers.get("content-type") || "")) { try { await g.up.body?.cancel(); } catch (_) {} return null; }
+  const r = g.up.body.getReader(), dec = new TextDecoder(); let html = "", n = 0;
+  while (n < UNFURL_HEAD_MAX) { const { value, done } = await r.read(); if (done) break; n += value.byteLength; html += dec.decode(value, { stream: true }); if (/<\/head\s*>|<body[\s>]/i.test(html)) break; }
+  try { await r.cancel(); } catch (_) {}
+  const head = html.split(/<\/head\s*>|<body[\s>]/i)[0], meta = {};
+  for (const m of head.matchAll(/<meta\b[^>]*>/gi)) {
+    const at = (k) => (new RegExp(`\\b${k}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(m[0]) || []).slice(1).find((x) => x != null);
+    const k = lc(at("property") || at("name") || ""), v = at("content"); if (k && v != null && !(k in meta)) meta[k] = htmlUnent(v).replace(/\s+/g, " ").trim();
+  }
+  const title = meta["og:title"] || meta["twitter:title"] || htmlUnent((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(head) || [])[1] || "").replace(/\s+/g, " ").trim();
+  if (!title) return null;
+  let image = meta["og:image:secure_url"] || meta["og:image"] || meta["twitter:image"] || meta["twitter:image:src"] || "";
+  try { image = image ? new URL(image, g.url).href : ""; } catch (_) { image = ""; }
+  if (!/^https:\/\//i.test(image) || image.length > 2048) image = "";
+  if (image) { try { const ih = new URL(image).hostname; if (badHost(ih) || (await resolvesPrivate(ih))) image = ""; } catch (_) { image = ""; } }   // the recipients' apps would ask it
+  return { url: u.href, title: title.slice(0, 200), description: (meta["og:description"] || meta["twitter:description"] || meta["description"] || "").slice(0, 300), image, site: (meta["og:site_name"] || g.url.hostname.replace(/^www\./, "")).slice(0, 80) };
+}
+async function unfurl(env, href) {
+  const key = "unfurl/" + (await imgKey(String(href))).slice(4), o = await env.STORE.get(key).catch(() => null);
+  if (o && Date.now() - Number(o.customMetadata?.at || 0) < UNFURL_KEEP_MS) { try { return JSON.parse(await o.text()); } catch (_) {} }
+  const p = await readPage(href).catch(() => null);
+  await env.STORE.put(key, JSON.stringify(p), { httpMetadata: { contentType: "application/json" }, customMetadata: { at: String(Date.now()) } }).catch(() => {});
+  return p;
+}
+// ---------- sender logos ----------
+// A company's logo beside its mail, as Apple Mail's Branded Mail and Gmail's BIMI logos: found by the hub, never by the apps, once per
+// domain and kept 30 days (a domain with none is asked again after 7). Shown only on mail whose own DMARC verdict passed (the apps'
+// logoShown); the BIMI SVG only for a domain that enforces DMARC, its site's icons whatever its policy; never for a free
+// mailbox domain, where the logo would be the mail provider's. A sender the user has had no mail from shows its logo only when the
+// picture is not a protected brand's (logoCopyOf). In order: the domain's BIMI logo (an SVG), the largest icon its home page names
+// (apple-touch-icon, or an icon of 48 px or more), its /apple-touch-icon.png. An SVG with script, a page or anything over 256 KB is
+// refused; a picture under 48 px is not used.
+const LOGO_MAX = 256 * 1024, LOGO_SVG_MAX = 64 * 1024, LOGO_KEEP_MS = 30 * 864e5, LOGO_NONE_MS = 7 * 864e5, LOGO_MIN_PX = 48, LOGO_RULES = "3";   // LOGO_RULES: a "none" kept under other rules is looked for again
+const logoStale = (m) => Date.now() - Number(m?.at || 0) >= (m?.none === "1" ? LOGO_NONE_MS : LOGO_KEEP_MS) || (m?.none === "1" && m?.v !== LOGO_RULES);
+const FREEMAIL = new Set(["gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me", "protonmail.com", "pm.me", "gmx.com", "gmx.net", "gmx.de", "web.de", "mail.com", "yandex.com", "yandex.ru", "zoho.com", "fastmail.com", "hey.com", "comcast.net", "att.net", "verizon.net", "sbcglobal.net", "qq.com", "163.com", "naver.com"]);
+const SLD2 = new Set(["co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp", "ne.jp", "co.kr", "com.br", "com.mx", "com.ar", "co.in", "co.za", "com.sg", "com.hk", "com.tw", "com.cn", "com.tr", "co.il", "com.my", "com.ph", "co.id", "com.co", "com.pe", "com.vn"]);
+function orgDomain(d) {
+  const p = lc(String(d || "")).replace(/\.$/, "").split("."); if (p.length < 2 || p.some((x) => !/^[a-z0-9-]{1,63}$/.test(x))) return null;
+  return SLD2.has(p.slice(-2).join(".")) && p.length >= 3 ? p.slice(-3).join(".") : p.slice(-2).join(".");
+}
+async function dnsTxt(name) {
+  try { const j = await (await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=TXT`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(4000) })).json(); return (j.Answer || []).filter((a) => a.type === 16).map((a) => String(a.data || "").replace(/"\s*"/g, "").replace(/^"|"$/g, "")); }
+  catch (_) { return []; }
+}
+const dmarcEnforced = async (dom) => { const t = (await dnsTxt("_dmarc." + dom)).find((x) => /^v=DMARC1/i.test(x.trim())) || ""; return /^(quarantine|reject)$/i.test((/(?:^|;)\s*p\s*=\s*(\w+)/i.exec(t) || [])[1] || ""); };
+async function readCapped(up, max) {
+  const r = up.body.getReader(), parts = []; let n = 0;
+  for (;;) { const { value, done } = await r.read(); if (done) break; n += value.byteLength; if (n > max) { try { await r.cancel(); } catch (_) {} return null; } parts.push(value); }
+  const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.byteLength; } return out;
+}
+const hostOk = async (u) => /^https?:$/.test(u.protocol) && !badHost(u.hostname) && !(await resolvesPrivate(u.hostname));
+const svgSafe = (s) => /<svg[\s>]/i.test(s) && !/<script|<foreignObject|\bon[a-z]+\s*=|javascript:|<iframe|<embed|<object|xlink:href\s*=\s*["']\s*(?!#|data:image\/)|\bhref\s*=\s*["']\s*(?!#|data:image\/)/i.test(s);
+// The size a PNG or an icon file says it is (JPEG, GIF, WebP: not read, taken as big enough).
+function picPx(b, ct) {
+  if (ct === "image/png" && b.byteLength > 24) return Math.min((b[16] << 24 | b[17] << 16 | b[18] << 8 | b[19]) >>> 0, (b[20] << 24 | b[21] << 16 | b[22] << 8 | b[23]) >>> 0);
+  if (ct === "image/x-icon" && b.byteLength > 6) { let best = 0; const n = b[4] | (b[5] << 8); for (let i = 0; i < n && 6 + i * 16 + 1 < b.byteLength; i++) best = Math.max(best, b[6 + i * 16] || 256); return best; }
+  return 999;
+}
+async function logoFrom(href, base) {
+  let u; try { u = new URL(href, base); } catch (_) { return null; }
+  if (u.protocol !== "https:" || !(await hostOk(u))) return null;
+  if (/\.svg(\?|$)/i.test(u.pathname)) {
+    const g = await fetchHops(u, "image/svg+xml,*/*;q=0.5"); if (!g.up) return null;
+    const b = await readCapped(g.up, LOGO_SVG_MAX); const s = b ? new TextDecoder().decode(b) : "";
+    return b && svgSafe(s) ? { bytes: b, ct: "image/svg+xml", src: u.href } : null;
+  }
+  const g = await fetchImageSafely(u, LOGO_MAX); if (!g.ok) return null;
+  const b = await new Response(g.body).arrayBuffer().then((x) => new Uint8Array(x)).catch(() => null);
+  return b && picPx(b, g.ct) >= LOGO_MIN_PX ? { bytes: b, ct: g.ct, src: u.href } : null;
+}
+// `all`: every variant the domain shows (its BIMI SVG, the icons its home page names, /apple-touch-icon.png, /favicon.ico; at most 5),
+// for the protected brands' fingerprints (logoCorpusTick); otherwise the first, best one. The BIMI SVG only for a domain that enforces
+// DMARC (BIMI's own rule); its site's icons whatever its policy: a logo shows only on mail whose own DMARC verdict passed,
+// so a spoofed From never carries it, and the policy stopped being what protects it.
+async function findLogo(dom, { all = false } = {}) {
+  if (!dom || FREEMAIL.has(dom)) return all ? [] : null;
+  const found = [], seen = new Set(), take = (got) => { if (!got || seen.has(got.src)) return false; seen.add(got.src); found.push(got); return !all || found.length >= 5; };
+  if (await dmarcEnforced(dom)) {
+    const bimi = (await dnsTxt("default._bimi." + dom)).find((x) => /^v=BIMI1/i.test(x.trim())) || "";
+    const l = (/(?:^|;)\s*l\s*=\s*([^;\s]+)/i.exec(bimi) || [])[1];
+    if (l) { const got = await logoFrom(l, "https://" + dom + "/").catch(() => null); if (take(got && { ...got, src: "bimi " + got.src })) return found[0]; }
+  }
+  const home = new URL("https://" + dom + "/"); if (!(await hostOk(home))) return all ? found : found[0] || null;
+  const g = await fetchHops(home, "text/html,*/*;q=0.5");
+  if (g.up && /html/i.test(g.up.headers.get("content-type") || "")) {
+    const r = g.up.body.getReader(); let html = "", n = 0;
+    while (n < 96 * 1024) { const { value, done } = await r.read(); if (done) break; n += value.byteLength; html += new TextDecoder().decode(value); if (/<\/head>/i.test(html)) break; }
+    try { await r.cancel(); } catch (_) {}
+    const head = html.split(/<\/head>/i)[0], picks = [];
+    for (const m of head.matchAll(/<link\b[^>]*>/gi)) {
+      const tag = m[0], at = (k) => (new RegExp(`\\b${k}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag) || []).slice(1).find((x) => x != null) || "";
+      const rel = lc(at("rel")), href = at("href"); if (!href || !/\bicon\b/.test(rel)) continue;
+      const size = Math.max(0, ...lc(at("sizes")).split(/\s+/).map((x) => parseInt(x, 10) || 0));
+      const svg = /svg/i.test(at("type")) || /\.svg(\?|$)/i.test(href);
+      picks.push({ href: href.replace(/&amp;/g, "&"), score: /apple-touch-icon/.test(rel) ? 1000 + (size || 180) : svg ? 900 : size });
+    }
+    // an icon with no size given is tried too, after the sized ones: its own bytes say how big it is (picPx)
+    for (const p of picks.sort((a, b) => b.score - a.score).slice(0, 4)) { if (p.score > 0 && p.score < LOGO_MIN_PX) continue; if (take(await logoFrom(p.href, g.url.href).catch(() => null))) return found[0]; }
+  } else if (g.up) { try { await g.up.body?.cancel(); } catch (_) {} }
+  for (const f of ["/apple-touch-icon.png", "/favicon.ico"]) if (take(await logoFrom(f, home.href).catch(() => null))) return found[0];   // an icon file of 48 px or more
+  return all ? found : found[0] || null;
+}
+// The daily job: the domains the list asked for that had none kept, then kept ones past their 30 days, a few dozen a day, at 09:00 UTC
+// whatever the user is doing; arriving mail looks its own sender up at arrival (ingestRaw, prefetchGmail).
+async function logoDaily(env) {
+  let n = 0;
+  const want = await env.STORE.list({ prefix: "logo-want/", limit: 40 }).catch(() => ({ objects: [] }));
+  for (const o of want.objects || []) { const dom = o.key.slice("logo-want/".length); try { await ensureLogo(env, orgDomain(dom)); n++; } catch (_) {} await env.STORE.delete(o.key).catch(() => {}); }
+  const kept = await env.STORE.list({ prefix: "logo/", limit: 500, include: ["customMetadata"] }).catch(() => ({ objects: [] }));
+  for (const o of (kept.objects || []).filter((x) => logoStale(x.customMetadata)).slice(0, 20)) { try { await ensureLogo(env, o.key.slice("logo/".length)); n++; } catch (_) {} }
+  return n;
+}
+const logoWork = new Map();   // domain -> the lookup under way in this isolate
+async function ensureLogo(env, dom) {
+  if (!dom || FREEMAIL.has(dom)) return null;
+  const key = "logo/" + dom, h = await env.STORE.head(key).catch(() => null);
+  if (h && !logoStale(h.customMetadata)) return h.customMetadata?.none === "1" ? null : key;
+  if (logoWork.has(dom)) return logoWork.get(dom);
+  const p = (async () => {
+    const got = await findLogo(dom).catch(() => null);
+    if (got) { const mk = await logoMarkOf(env, got.bytes); await env.STORE.put(key, got.bytes, { httpMetadata: { contentType: got.ct }, customMetadata: { at: String(Date.now()), src: got.src.slice(0, 300), ...logoMarkMeta(mk) } }); if (mk) await logoMarkKeep(env, dom, mk, "kept"); }
+    else await env.STORE.put(key, new Uint8Array(0), { customMetadata: { at: String(Date.now()), none: "1", v: LOGO_RULES } });
+    return got ? key : null;
+  })().finally(() => logoWork.delete(dom));
+  if (logoWork.size < 100) logoWork.set(dom, p);
+  return p;
+}
+// ---------- copied logos ----------
+// A sender the user has had no mail from, whose logo is the picture of a protected brand it is not, shows its letter: the look-alike
+// domain that copied a brand's icon onto its own site or BIMI record. Protected brands are the domains that have written to the user
+// (impostorKnown) and Tranco's top LOGO_TOP sites (fingerprinted by logoCorpusTick, a few a minute, the list fetched again every 30
+// days). Fingerprints come from the mailhub-img Worker (img/src/logomark.js, a service binding): a perceptual hash and a colour grid.
+// Measured 2026-11-26 on 1,493 logos (logomark.js): copies re-saved, converted or shrunk and padded matched 81-94 %; of the user's 355
+// senders' logos taken as strangers', 20 matched another name's, 19 of them the same company's other domain. A sender the user has had
+// mail from is not compared (a company's second domain shows its own logo there), nor is a protected brand itself.
+const LOGO_COPY = { bits: 8, colour: 24, flat: 12 }, LOGO_TOP = 5000, LOGO_NAMES_TOP = 10000;
+const logoMarkMeta = (mk) => (mk ? { ph: mk.ph, sig: mk.sig, sd: String(mk.sd) } : {});
+async function logoMarkOf(env, bytes) {
+  if (!env.IMGW || !bytes?.byteLength) return null;
+  try {
+    const r = await env.IMGW.fetch("https://mailhub-img/logo-mark", { method: "POST", body: bytes, signal: AbortSignal.timeout(8000) });
+    const j = await r.json().catch(() => null);
+    return r.ok && j && /^[0-9a-f]{16}$/.test(j.ph || "") && /^[0-9a-f]{96}$/.test(j.sig || "") ? { ph: j.ph, sig: j.sig, sd: Number(j.sd) || 0 } : null;
+  } catch (_) { return null; }
+}
+async function logoMarkKeep(env, org, mk, src) {
+  if (!mk || mk.sd < LOGO_COPY.flat) return;
+  await env.DB.prepare("INSERT INTO logo_marks (org, ph, sig, sd, src, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(org, ph) DO UPDATE SET sig = excluded.sig, sd = excluded.sd, src = excluded.src, at = excluded.at")
+    .bind(org, mk.ph, mk.sig, mk.sd, src, now()).run().catch(() => {});
+  logoMarksCache.at = 0;
+}
+const popcnt = (x) => { x -= (x >>> 1) & 0x55555555; x = (x & 0x33333333) + ((x >>> 2) & 0x33333333); return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24; };
+const markParse = (r) => ({ org: r.org, hi: parseInt(r.ph.slice(0, 8), 16) | 0, lo: parseInt(r.ph.slice(8), 16) | 0, sig: Uint8Array.from(r.sig.match(/../g).map((x) => parseInt(x, 16))) });
+let logoMarksCache = { at: 0, v: null };
+async function logoMarks(env) {
+  if (logoMarksCache.v && Date.now() - logoMarksCache.at < 10 * 60e3) return logoMarksCache.v;
+  const { results } = await env.DB.prepare("SELECT org, ph, sig FROM logo_marks").all();
+  logoMarksCache = { at: Date.now(), v: (results || []).filter((r) => /^[0-9a-f]{16}$/.test(r.ph) && /^[0-9a-f]{96}$/.test(r.sig)).map(markParse) };
+  return logoMarksCache.v;
+}
+// The top sites, kept by logoCorpusTick in R2 (brands/top.json: { id, at, domains }), for the copied-logo check and the apps' name check.
+let logoTopCache = { at: 0, v: null };
+async function logoTop(env) {
+  if (logoTopCache.v && Date.now() - logoTopCache.at < 10 * 60e3) return logoTopCache.v;
+  const o = await env.STORE.get("brands/top.json").catch(() => null); let j = null; try { j = o ? JSON.parse(await o.text()) : null; } catch (_) { j = null; }
+  const domains = Array.isArray(j?.domains) ? j.domains : [];
+  logoTopCache = { at: Date.now(), v: { domains, set: new Set(domains.slice(0, LOGO_TOP)), id: j?.id || null, at: j?.at || null } };
+  return logoTopCache.v;
+}
+// The protected brand whose logo this is, or null. `dom`: the sender's organisational domain; `mk`: its logo's fingerprint.
+async function logoCopyOf(env, dom, mk) {
+  if (!mk || mk.sd < LOGO_COPY.flat) return null;
+  const known = await impostorKnown(env), top = (await logoTop(env)).set;
+  if (known.orgs.has(dom) || top.has(dom)) return null;
+  const me = markParse({ org: dom, ...mk });
+  for (const m of await logoMarks(env)) {
+    if (m.org === dom || !(known.orgs.has(m.org) || top.has(m.org))) continue;
+    if (popcnt(m.hi ^ me.hi) + popcnt(m.lo ^ me.lo) > LOGO_COPY.bits) continue;
+    let c = 0; for (let i = 0; i < 48; i++) c += Math.abs(m.sig[i] - me.sig[i]);
+    if (c / 48 <= LOGO_COPY.colour) return m.org;
+  }
+  return null;
+}
+// Every minute, a few protected brands' logo variants fingerprinted, and the logos kept before fingerprints existed. The top list is
+// fetched from Tranco's latest list when the one held is 30 days old (its domains only; Tranco sees the hub, not the user).
+async function logoCorpusTick(env, budgetMs = 20_000) {
+  if (!env.IMGW) return { n: 0 };
+  const t0 = Date.now(); let n = 0;
+  let pr = {}; try { const o = await env.STORE.get("brands/progress.json"); pr = o ? JSON.parse(await o.text()) || {} : {}; } catch (_) { pr = {}; }
+  logoTopCache.at = 0; const top = await logoTop(env);   // the stored list, not this isolate's copy
+  if (!top.id || Date.now() - Date.parse(top.at || 0) > 30 * 864e5) {
+    try {
+      const meta = await (await fetch("https://tranco-list.eu/api/lists/date/latest", { signal: AbortSignal.timeout(10000) })).json();
+      if (meta?.list_id && meta.list_id !== top.id) {
+        const csv = await (await fetch(`https://tranco-list.eu/download/${encodeURIComponent(meta.list_id)}/${LOGO_NAMES_TOP}`, { signal: AbortSignal.timeout(20000) })).text();
+        const domains = csv.split(/\r?\n/).map((l) => (l.split(",")[1] || "").trim().toLowerCase()).filter((d) => orgDomain(d) === d && !FREEMAIL.has(d));
+        if (domains.length > 1000) { await env.STORE.put("brands/top.json", JSON.stringify({ id: meta.list_id, at: now(), domains }), { httpMetadata: { contentType: "application/json" } }); logoTopCache.at = 0; pr.next = 0; pr.id = meta.list_id; }
+      } else if (meta?.list_id) { await env.STORE.put("brands/top.json", JSON.stringify({ ...top, at: now() }), { httpMetadata: { contentType: "application/json" } }); logoTopCache.at = 0; }
+    } catch (_) {}
+  }
+  const doms = (await logoTop(env)).domains.slice(0, LOGO_TOP);
+  while ((pr.next || 0) < doms.length && Date.now() - t0 < budgetMs && n < 12) {
+    const d = doms[pr.next || 0]; pr.next = (pr.next || 0) + 1; n++;
+    for (const v of await findLogo(d, { all: true }).catch(() => [])) { if (Date.now() - t0 > budgetMs + 10_000) break; await logoMarkKeep(env, d, await logoMarkOf(env, v.bytes), "brand"); }
+  }
+  // logos kept before fingerprints existed: a few each minute
+  if (Date.now() - t0 < budgetMs) {
+    const kept = await env.STORE.list({ prefix: "logo/", limit: 1000, cursor: pr.keptCursor || undefined, include: ["customMetadata"] }).catch(() => null);
+    for (const o of (kept?.objects || []).filter((x) => x.size > 0 && !x.customMetadata?.ph).slice(0, 8)) {
+      if (Date.now() - t0 > budgetMs) break;
+      const obj = await env.STORE.get(o.key).catch(() => null); if (!obj) continue;
+      const b = new Uint8Array(await obj.arrayBuffer()), mk = await logoMarkOf(env, b); if (!mk) continue;
+      await env.STORE.put(o.key, b, { httpMetadata: obj.httpMetadata, customMetadata: { ...obj.customMetadata, ...logoMarkMeta(mk) } }); await logoMarkKeep(env, o.key.slice(5), mk, "kept"); n++;
+    }
+    pr.keptCursor = kept?.truncated ? kept.cursor : null;
+  }
+  await env.STORE.put("brands/progress.json", JSON.stringify(pr), { httpMetadata: { contentType: "application/json" } }).catch(() => {});
+  return { n, next: pr.next || 0, of: doms.length };
+}
 // ---------- picture sizes ----------
 // The width and height a browser lays a picture out at, read from its header without decoding it, or null: PNG's IHDR, GIF's logical
 // screen, WebP's VP8 / VP8L / VP8X header, JPEG's first frame header (turned a quarter when its EXIF orientation is 5-8, which browsers
@@ -949,7 +1281,11 @@ const fontDecls = (body) => String(body).split(";").map((d) => { const i = d.ind
 export function fontFaces(css, base = null) {
   const out = [];
   for (const m of cssNoComments(css).matchAll(/@font-face\s*\{([^{}]*)\}/gi)) {
-    const decls = fontDecls(m[1]), get = (n) => (decls.find((d) => d[0] === n) || [])[1] || "";
+    // The LAST declaration of a name is the one the browser uses (a later declaration overrides an earlier one in the same rule). A face
+    // written `src: url(x.eot); src: url(x.eot?#iefix) format("embedded-opentype"), url(x.woff2) format("woff2")` (the old IE
+    // pattern, which some senders still write, inline and in their stylesheets) takes its woff2 from the second; reading the first found
+    // only the EOT file and kept nothing, so the mail drew in a fallback and swapped to its next family.
+    const decls = fontDecls(m[1]), get = (n) => (decls.filter((d) => d[0] === n).pop() || [])[1] || "";
     let src = null, fmt = "";
     for (const c of get("src").matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)\s*(?:format\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\))?/gi)) {
       const raw = (c[1] ?? c[2] ?? c[3] ?? "").trim(), f = (c[4] ?? c[5] ?? c[6] ?? "").trim().toLowerCase();
@@ -1652,6 +1988,9 @@ async function prefetchGmail(env, at, account, ids) {
       const m = await gmailApi(at, `messages/${id}?format=full`);
       if ((m.labelIds || []).some((l) => l === "SPAM" || l === "TRASH" || l === "SENT")) continue;   // spam and trash never signal; our own mail needs nothing
       const html = gmailHtmlPart(m.payload); if (html) await prefetchImages(env, html, `gmail:${account}:${id}`, { deadline, left, from: addrOnly(hdrVal(m, "From")) });
+      // the sender's logo at arrival, not when the list is looked at: a list's mail whose From Gmail's own stamp proves
+      const fromA = addrOnly(hdrVal(m, "From")), arTop = ((m.payload || {}).headers || []).find((h) => lc(h.name) === "authentication-results")?.value;
+      if (hdrVal(m, "List-Unsubscribe") && dmarcProves(arTop, "mx.google.com", fromA)) ctxWaitUntil(ensureLogo(env, orgDomain(String(fromA).split("@")[1])).catch(() => {}));
     } catch (_) {}
   }
 }
@@ -2670,15 +3009,19 @@ async function ingestRaw(env, raw, o) {
     for (const a of p.attachments.slice(0, ATTACHMENT_MAX_COUNT)) {
       n += 1;
       const key = `att/${id}/${n}-${safeName(a.filename)}`;
-      const bytes = a.content instanceof ArrayBuffer ? a.content : new TextEncoder().encode(String(a.content || ""));
+      // postal-mime hands a calendar part (text/calendar, application/ics) over as a Uint8Array, every other part as an ArrayBuffer. Only
+      // an ArrayBuffer was kept as bytes, so every invitation was stored as the text of its byte values, "66,69,71,...".
+      const bytes = a.content instanceof ArrayBuffer || ArrayBuffer.isView(a.content) ? a.content : new TextEncoder().encode(String(a.content || ""));
       await env.STORE.put(key, bytes, { httpMetadata: { contentType: a.mimeType || "application/octet-stream" } });
       await db.prepare("INSERT INTO attachments (id, message_id, filename, content_type, size_bytes, r2_key, content_id, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(uuid(), id, a.filename || `${a.disposition === "inline" ? "inline" : "attachment"}-${n}${({ "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp", "application/pdf": ".pdf" })[(a.mimeType || "").toLowerCase()] || ""}`, a.mimeType || null, bytes.byteLength, key, a.contentId || null, a.disposition || null).run();
+        .bind(uuid(), id, a.filename || `${a.disposition === "inline" ? "inline" : "attachment"}-${n}${({ "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp", "application/pdf": ".pdf", "text/calendar": ".ics" })[(a.mimeType || "").toLowerCase()] || ""}`, a.mimeType || null, bytes.byteLength, key, a.contentId || null, a.disposition || null).run();
     }
   }
   // The images of mail that reaches the inbox are fetched now, while nobody is reading it; never for held, blocked,
   // rate-limited, over-budget or unparsed mail, or a thread already in trash or spam.
   if (html && !out && !o.storeOnly && o.gmailCopy !== "held" && !["trademark-scam", "blocked", "rate-limited", "over-budget", "locked-out", "trash-rule", "mention-rule", "impostor"].includes(label) && !["trash", "spam"].includes(th?.state)) ctxWaitUntil(prefetchImages(env, html, `hub:${id}`, { from: from?.address }));
+  // the sender's logo, while nobody is looking: business mail only, as the list shows it
+  if (!out && !o.storeOnly && ["notifications", "newsletters"].includes(category) && dmarcProves(authTop, "mx.cloudflare.net", from?.address) && !["trademark-scam", "blocked", "rate-limited", "over-budget", "locked-out", "trash-rule", "mention-rule", "impostor"].includes(label) && !["trash", "spam"].includes(th?.state)) ctxWaitUntil(ensureLogo(env, orgDomain(String(from?.address || "").split("@")[1])).catch(() => {}));
   if (mention) {
     try { await db.batch([db.prepare("INSERT INTO mention_decisions (account, id, rule_id, decision, from_addr, subject, at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account, id) DO NOTHING").bind(MENTION_HUB, id, mention.rule.id, mention.decision, lc(mention.sender), String(subject || "").slice(0, 300), now()),
       db.prepare(`UPDATE mention_rules SET ${mentionDrop ? "dropped = dropped + 1" : "kept = kept + 1"}, last_at = ? WHERE id = ?`).bind(now(), mention.rule.id)]); }
@@ -3152,6 +3495,32 @@ function sendView({ via, from, name, to, cc, bcc, subject, inReplyTo, files }) {
   const box = (x) => (typeof x === "string" ? x : x.name ? `${x.name} <${x.email}>` : x.email);
   return { dry_run: true, via, from: name ? `${name} <${from}>` : from, to: to.map(box), cc: cc.map(box), bcc: bcc.map(box), subject, in_reply_to: inReplyTo || null, attachments: files };
 }
+// An invitation's answer: `calendar: { method: "REPLY", ics }` sends the text and an iTIP REPLY (RFC 6047 iMIP) as
+// multipart/alternative, text/plain then text/calendar; method=REPLY, the shape Outlook and Google Calendar send theirs in and read.
+// Only REPLY, only a VCALENDAR that says so, at most 64 KB, and no files beside it.
+function calendarOf(body) {
+  const c = body.calendar; if (!c) return null;
+  const ics = String(c.ics || "");
+  if (c.method !== "REPLY" || ics.length > 65536 || !/^BEGIN:VCALENDAR\r?\n/.test(ics) || !/\r?\nMETHOD:REPLY\r?\n/.test(ics) || !/\r?\nEND:VCALENDAR\s*$/.test(ics) || /[\0]/.test(ics)) throw Object.assign(new Error("calendar must be an iCalendar REPLY"), { code: "bad_calendar" });
+  if ((body.attachments || []).length) throw Object.assign(new Error("a calendar answer carries no files"), { code: "bad_calendar" });
+  // one event, and nothing nested in it but a time zone's own parts
+  const begins = [...ics.matchAll(/^BEGIN:([^\r\n]*)/gim)].map((x) => x[1].trim().toUpperCase());
+  if (begins.filter((b) => b === "VEVENT").length !== 1 || begins.some((b) => !["VCALENDAR", "VEVENT", "VTIMEZONE", "STANDARD", "DAYLIGHT"].includes(b))) throw Object.assign(new Error("calendar must be one event"), { code: "bad_calendar" });
+  return { method: "REPLY", ics: ics.replace(/\r?\n/g, "\r\n") };
+}
+const wrap76 = (b) => b.replace(/(.{76})/g, "$1\r\n");
+function calendarMime({ from, fromName, to, cc, subject, headers = {}, text, cal, messageId = null }) {
+  const enc = (s) => /^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${b64utf8(s)}?=`;
+  const named = (name, addr) => name ? `${/^[\x20-\x7e]*$/.test(name) ? `"${oneHdr(name).replace(/["\\]/g, "")}"` : enc(oneHdr(name))} <${addr}>` : addr;
+  const box = (x) => typeof x === "string" ? oneHdr(x) : named(x.name || "", oneHdr(x.email));
+  const b = "=_cal_" + uuid().replace(/-/g, "");
+  const lines = [`From: ${named(fromName || "", from)}`, `To: ${to.map(box).join(", ")}`, ...(cc.length ? [`Cc: ${cc.map(box).join(", ")}`] : []), `Subject: ${enc(oneHdr(subject))}`,
+    `Date: ${new Date().toUTCString().replace(/GMT$/, "+0000")}`, "MIME-Version: 1.0", `Message-ID: ${messageId || `<${uuid()}@${String(from).split("@")[1] || "mailhub"}>`}`,   // as mimetext writes one for every other built send
+    ...Object.entries(headers).map(([k, v]) => `${k}: ${oneHdr(v)}`), `Content-Type: multipart/alternative; boundary="${b}"`, "",
+    `--${b}`, "Content-Type: text/plain; charset=UTF-8", "Content-Transfer-Encoding: base64", "", wrap76(b64utf8(text || "")),
+    `--${b}`, `Content-Type: text/calendar; charset=UTF-8; method=${cal.method}`, "Content-Transfer-Encoding: base64", "", wrap76(b64utf8(cal.ics)), `--${b}--`, ""];
+  return lines.join("\r\n");
+}
 async function sendMail(env, body, opts = {}) {
   assertHeaderSafe(body);
   const db = env.DB;
@@ -3177,6 +3546,7 @@ async function sendMail(env, body, opts = {}) {
   const subject = (body.subject || "").toString();
   const text = bodyText(body), html = body.html ?? null;
   if (!text && !html) throw new Error("text or html is required");
+  const cal = calendarOf(body);
 
   const parent = await replyParent(db, body, from);
   if (body.reply_to_id && !parent) throw new Error("reply_to_id not found");
@@ -3265,7 +3635,7 @@ async function sendMail(env, body, opts = {}) {
   // base64-encodes binary parts but labels them quoted-printable (measured in September 2026), which corrupts every attachment.
   let r, raw = null;
   try {
-  if (attachments.length) {
+  if (attachments.length || cal) {
     const mm = createMimeMessage();
     mm.setSender(ident?.display_name ? { name: ident.display_name, addr: from } : from);
     const asBox = (x) => (typeof x === "string" ? x : { name: x.name || "", addr: x.email });
@@ -3280,7 +3650,7 @@ async function sendMail(env, body, opts = {}) {
       let s = ""; for (let i = 0; i < a.content.length; i += 0x8000) s += String.fromCharCode.apply(null, a.content.subarray(i, i + 0x8000));
       mm.addAttachment({ filename: a.filename, contentType: a.type, data: btoa(s), inline: a.disposition === "inline", ...(a.contentId ? { headers: { "Content-ID": `<${a.contentId}>` } } : {}) });
     }
-    raw = mm.asRaw();
+    raw = cal ? calendarMime({ from, fromName: ident?.display_name || "", to, cc, subject, headers: { ...headers, ...(body.replyTo ? { "Reply-To": typeof body.replyTo === "string" ? body.replyTo : body.replyTo.email } : {}) }, text: text || "", cal }) : mm.asRaw();
     const rcpts = [...to, ...cc, ...bcc].map(addrOnly).filter(Boolean);
     const ids = [], undelivered = [];
     // One envelope per recipient: once one has gone, a later failure is reported with the mail, not as "not sent" (sending again
@@ -3478,7 +3848,7 @@ async function api(request, env, url) {
     // Content-ID the body showed 45, so 15 were files; 3 of 69 marked inline were not shown either. client app.js bodyImage() is the
     // same rule for the message header's count. No rows beyond the thread's own messages and their attachments are read.
     let sql = `SELECT t.id, t.subject_norm, t.participants, t.last_message_at, t.message_count, t.state, t.starred, t.unread, t.labels, t.category, t.updated_at,
-      (SELECT json_object('id', m.id, 'direction', m.direction, 'from_addr', m.from_addr, 'from_name', m.from_name, 'identity', m.identity, 'subject', m.subject, 'snippet', m.snippet, 'created_at', m.created_at, 'message_id', m.message_id, 'to_addrs', m.to_addrs, 'list_unsubscribe', m.list_unsubscribe, 'list_unsubscribe_post', m.list_unsubscribe_post)
+      (SELECT json_object('id', m.id, 'direction', m.direction, 'from_addr', m.from_addr, 'from_name', m.from_name, 'identity', m.identity, 'subject', m.subject, 'snippet', m.snippet, 'created_at', m.created_at, 'message_id', m.message_id, 'to_addrs', m.to_addrs, 'list_unsubscribe', m.list_unsubscribe, 'list_unsubscribe_post', m.list_unsubscribe_post, 'auth_results', m.auth_results)
          FROM messages m WHERE m.thread_id = t.id ORDER BY m.created_at DESC LIMIT 1) AS last,
       (SELECT json_object('list_unsubscribe', m3.list_unsubscribe, 'list_unsubscribe_post', m3.list_unsubscribe_post) FROM messages m3 WHERE m3.thread_id = t.id AND m3.direction = 'in' AND m3.list_unsubscribe IS NOT NULL ORDER BY m3.created_at DESC LIMIT 1) AS unsub,
       (SELECT json_group_array(m2.message_id) FROM messages m2 WHERE m2.thread_id = t.id AND m2.message_id IS NOT NULL) AS msg_ids,
@@ -3533,7 +3903,9 @@ async function api(request, env, url) {
       const pre = allStates ? [] : binds;
       const q2 = head + (extraWhere ? (!allStates && where.length ? " AND " : " WHERE ") + extraWhere : "") + " ORDER BY t.last_message_at DESC LIMIT ?";
       const { results } = await db.prepare(q2).bind(...pre, ...extraBinds, limit).all();
-      return results.map((r) => ({ ...r, last: r.last ? JSON.parse(r.last) : null, msg_ids: r.msg_ids ? JSON.parse(r.msg_ids) : [] }));
+      // `proven`: Cloudflare's own stamp says the newest mail passed DMARC for its From's domain (a sender logo shows only
+      // then); the stamp itself stays here
+      return results.map((r) => { const last = r.last ? JSON.parse(r.last) : null; if (last) { last.proven = last.direction === "in" && dmarcProves(last.auth_results, "mx.cloudflare.net", last.from_addr) ? 1 : 0; delete last.auth_results; } return { ...r, last, msg_ids: r.msg_ids ? JSON.parse(r.msg_ids) : [] }; });
     };
     if (sinceSeq !== null && sinceSeq !== undefined && sinceSeq !== "") {
       const from = parseInt(sinceSeq, 10); if (!Number.isFinite(from) || from < 0) return json({ error: "bad since_seq" }, 400);
@@ -3695,6 +4067,43 @@ async function api(request, env, url) {
   // the /api/img address the frame may load fonts from, carrying this request's key and the mail's arrival time, so a font is answered
   // exactly as that mail's pictures are (never fetched from its sender at an open). Nothing is fetched here: a stylesheet the hub does
   // not hold is answered empty, and the mail shows in its next font.
+  if (path === "/api/drops" || path.startsWith("/api/drops/")) { const r = await dropsApi(request, env, path); if (r) return r; }   // big files as links
+  if (request.method === "GET" && path === "/api/unfurl") return json({ preview: await unfurl(env, url.searchParams.get("u") || "") });   // a link's preview
+  if (request.method === "GET" && path === "/api/logo") {   // a sender's logo, found by the hub and kept
+    const dom = orgDomain(url.searchParams.get("d") || ""), none = (cc = "private, max-age=86400") => new Response(null, { status: 404, headers: { "Cache-Control": cc } });
+    if (!dom || FREEMAIL.has(dom)) return none();
+    // A domain not looked up yet is looked up NOW, and its logo answered in this same request when the lookup ends within 6 s, so
+    // a logo is there when the app opens. An earlier rule looked domains up only in the daily job, which hid the lookup's timing from a
+    // sender's DNS and site; showing the logo at once was judged worth more. A lookup still running at 6 s finishes in the background
+    // and answers the next ask (the app asks again after an hour; a miss answer is cached 5 minutes).
+    let obj = await env.STORE.get("logo/" + dom);
+    // A "none" kept under earlier rules (or past its 7 days) is looked up again now, as a domain never looked up is (the
+    // rules of 2026-11-26 take site icons from domains that do not enforce DMARC, which the old "none" answers had refused).
+    if (obj && obj.customMetadata?.none === "1" && logoStale(obj.customMetadata)) { try { await obj.body?.cancel(); } catch (_) {} obj = null; }
+    if (!obj) {
+      const work = ensureLogo(env, dom).catch(() => null); ctxWaitUntil(work);
+      const done = await Promise.race([work.then(() => true), new Promise((r) => setTimeout(() => r(false), 6000))]);
+      obj = done ? await env.STORE.get("logo/" + dom) : null;
+      if (!obj) return none("private, max-age=300");
+    }
+    if (obj.customMetadata?.none === "1" || !obj.size) return none();
+    // A sender the user has had no mail from shows its letter when its logo is a protected brand's (logoCopyOf); a
+    // logo whose fingerprint cannot be had is not shown to such a sender either (it fails closed, and is asked again in five minutes).
+    const known = await impostorKnown(env), top = (await logoTop(env)).set;
+    let body = obj.body;
+    if (!known.orgs.has(dom) && !top.has(dom)) {
+      const m = obj.customMetadata || {};
+      let mk = /^[0-9a-f]{16}$/.test(m.ph || "") ? { ph: m.ph, sig: m.sig, sd: Number(m.sd) || 0 } : null;
+      if (!mk) {
+        const b = new Uint8Array(await obj.arrayBuffer()); body = b; mk = await logoMarkOf(env, b);
+        if (!mk) return none("private, max-age=300");
+        ctxWaitUntil(env.STORE.put("logo/" + dom, b, { httpMetadata: obj.httpMetadata, customMetadata: { ...m, ...logoMarkMeta(mk) } }).catch(() => {}));
+      }
+      const copied = await logoCopyOf(env, dom, mk);
+      if (copied) return new Response(null, { status: 404, headers: { "Cache-Control": "private, max-age=3600", "X-Logo-Refused": "the picture is " + copied + "'s" } });
+    }
+    return new Response(body, { headers: { "Content-Type": obj.httpMetadata?.contentType || "application/octet-stream", "Cache-Control": "private, max-age=604800", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox", "X-Content-Type-Options": "nosniff" } });
+  }
   if (request.method === "GET" && path === "/api/fontcss") {
     const css = (body, cc) => new Response(body, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": cc, "x-content-type-options": "nosniff" } });
     let u; try { u = new URL(url.searchParams.get("u") || ""); } catch (_) { return css("/* bad url */", "no-store"); }
@@ -4222,7 +4631,11 @@ async function api(request, env, url) {
     return json({ ok: true, deleted: 1 });
   }
   if ((x = m(/^\/api\/drafts\/([0-9a-f-]{36})\/files$/)) && request.method === "POST") {
-    const draftId = x[1]; const bytes = await request.arrayBuffer(); const size = bytes.byteLength;
+    // refused on its declared size before a byte is read: a file of 90 MB, attached to go as a link, made the Worker hold
+    // it all in its 128 MB before saying it was too big, and the app took the failure for a network one and sent it again
+    const draftId = x[1]; const got = await bodyCapped(request, DRAFT_FILES_MAX);
+    if (!got) return json({ error: `a draft keeps up to ${DRAFT_FILES_MAX / 1048576} MB of files` }, 413);
+    const bytes = got.buffer.slice(got.byteOffset, got.byteOffset + got.byteLength); const size = bytes.byteLength;
     if (!size) return json({ error: "empty file" }, 400);
     const held = (await db.prepare("SELECT COALESCE(SUM(size), 0) n FROM draft_files WHERE draft_id = ?").bind(draftId).first())?.n || 0;
     if (held + size > DRAFT_FILES_MAX) return json({ error: `a draft keeps up to ${DRAFT_FILES_MAX / 1048576} MB of files` }, 413);
@@ -4309,7 +4722,9 @@ async function api(request, env, url) {
     return json({ received, sent });
   }
   // The domains that have written to the user, for the app's impostor banner: read once a session.
-  if (request.method === "GET" && path === "/api/senders/orgs") return json({ orgs: await impostorOrgs(env) });
+  // `brands`: the top sites whose name the apps' logo check protects as well (a sender named after one, from a domain
+  // that is not its own, shows its letter); names of four letters or more, as shorter ones are ordinary words.
+  if (request.method === "GET" && path === "/api/senders/orgs") return json({ orgs: await impostorOrgs(env), brands: (await logoTop(env)).domains.filter((d) => d.split(".")[0].replace(/[^a-z0-9]/g, "").length >= 4) });
   if (request.method === "GET" && path === "/api/senders") {
     const status = url.searchParams.get("status") || "pending";
     const { results } = await db.prepare("SELECT * FROM known_senders WHERE status = ? ORDER BY last_seen_at DESC LIMIT 500").bind(status).all();
@@ -5930,6 +6345,7 @@ async function sendViaImapAccountInner(env, body, acct, stage = {}) {
   if (!to.length) throw new Error("to is required");
   const subject = (body.subject || "").toString(); const text = bodyText(body), html = body.html ?? null;
   if (!text && !html) throw new Error("text or html is required");
+  const cal = calendarOf(body);   // an invitation's answer
   const parent = await replyParent(db, body, acct.email);
   const mm = createMimeMessage();
   mm.setSender(fromName ? { name: fromName, addr: acct.email } : acct.email);
@@ -5950,7 +6366,7 @@ async function sendViaImapAccountInner(env, body, acct, stage = {}) {
     files.push({ bytes, filename: a.filename, type: a.type || "application/octet-stream", cid: cid || null, disposition: inline ? "inline" : "attachment" });
     mm.addAttachment({ filename: a.filename, contentType: a.type || "application/octet-stream", data, inline, ...(cid ? { headers: { "Content-ID": `<${cid}>` } } : {}) });
   }
-  const raw = mm.asRaw();
+  const raw = cal ? calendarMime({ from: acct.email, fromName: fromName || "", to, cc, subject, messageId, headers: { ...(inReplyTo ? { "In-Reply-To": inReplyTo, References: refs } : {}) }, text: text || "", cal }) : mm.asRaw();
   if (raw.length > 25 * 1024 * 1024) throw new Error("message exceeds 25 MiB");
   const rcpts = [...to, ...cc, ...bcc].map(addrOnly).filter(Boolean);
   const smtpReply = await smtpSubmit(acct, acct.email, rcpts, raw, stage);
@@ -6723,7 +7139,19 @@ export async function gmailPollAccount(env, a, rules, policy) {
 // No bodies, attachments, raw MIME or drafts are stored. Gmail stays the system of record; the user's actions still go device → Gmail.
 // GETS: 150 a minute is 3,000 quota units, half the per-user minute the devices and the notification poll share.
 const GMAIL_MIRROR_DAYS = 90, GMAIL_MIRROR_GETS = 150, GMAIL_MIRROR_PAGES = 50, GMAIL_STUB_DAYS = 31;
-const GMAIL_META_HEADERS = ["From", "To", "Cc", "Subject", "Date", "List-Unsubscribe", "List-Id", "Precedence", "Auto-Submitted", "Message-ID", "In-Reply-To", "References", "List-Unsubscribe-Post"];
+const GMAIL_META_HEADERS = ["From", "To", "Cc", "Subject", "Date", "List-Unsubscribe", "List-Id", "Precedence", "Auto-Submitted", "Message-ID", "In-Reply-To", "References", "List-Unsubscribe-Post", "Authentication-Results"];
+// Gmail's own DMARC verdict, which a device needs to show a sender's logo: the topmost mx.google.com stamp (Gmail writes
+// its own above any a sender planted), cut to its one dmarc clause, so the mirror keeps about 80 bytes a message, not the 300 to 900 of the
+// whole header. A stamp with no dmarc clause or with two (a planted one, dmarcClause) keeps nothing, and the device reads that as unproven.
+// Without it, Gmail rows on every device reached the list unproven and no logo showed (field report 2026-11-26).
+function gmailProofOnly(m) {
+  const hs = m?.payload?.headers; if (!Array.isArray(hs)) return m;
+  const isAr = (x) => /^authentication-results$/i.test(String(x?.name || ""));
+  const top = hs.filter(isAr).map((x) => String(x.value || "").replace(/\s+/g, " ").trim()).find((v) => v.toLowerCase().startsWith("mx.google.com;"));
+  const c = top ? dmarcClause(top) : "";
+  m.payload.headers = hs.filter((x) => !isAr(x)).concat(c ? [{ name: "Authentication-Results", value: "mx.google.com; " + c }] : []);
+  return m;
+}
 const GMAIL_META_QS = "format=metadata&" + GMAIL_META_HEADERS.map((h) => "metadataHeaders=" + h).join("&");
 const gmailIdMs = (id) => parseInt(String(id || "").slice(0, -5), 16) || 0;   // id >> 20 is never earlier than internalDate (30 samples)
 const gmailMirrorOn = (env) => env.GMAIL_MIRROR !== "off";
@@ -6864,7 +7292,7 @@ function gmailMirrorFetched(got, owed, held, cutoff, w) {
     // When it reached the mailbox: the later of internalDate and the id's own time. Spam can carry a 1970 internalDate (five in
     // sam.owner.sxsw@gmail.com's Spam on 2026-10-07, ids from this month), and by internalDate alone it would never be in the window.
     const d = Math.max(Number(m.internalDate) || 0, gmailIdMs(m.id)) || null, h = m.historyId ? String(m.historyId) : null;
-    if (gmailMirrorScope(l, d, cutoff)) full.push({ id: m.id, t: m.threadId, l, d, m, h });
+    if (gmailMirrorScope(l, d, cutoff)) full.push({ id: m.id, t: m.threadId, l, d, m: gmailProofOnly(m), h });
     else if (held.has(m.id)) w.relabel.push({ id: m.id, l, h }); else w.stubs.push({ id: m.id, t: m.threadId, l, h });
   }
   for (const id of got.gone) { owed.delete(id); w.gone.push(id); }
@@ -7345,10 +7773,12 @@ export default {
     if (minute === 20) { try { await trkLearn(env); } catch (e) { await logEvent(env.DB, "trk_learn_fail", null, e?.message); } }
     if (d.getUTCHours() === 8 && minute === 30) { try { await trkCanaries(env); } catch (e) { await logEvent(env.DB, "trk_canary_fail", null, e?.message); } }
     if (d.getUTCHours() === 8 && minute === 40) { try { await trkRefreshLists(env); } catch (e) { await logEvent(env.DB, "trk_lists_fail", null, e?.message); } }
+    // Protected brands' logo fingerprints, a few a minute: after the mail, not in the daily minute.
+    if (d.getUTCHours() !== 9 || minute !== 0) { try { await logoCorpusTick(env, 15_000); } catch (e) { await logEvent(env.DB, "logo_corpus_fail", null, e?.message); } }
     // Last, after everything that keeps mail flowing, and not in the daily minute: one leftover unsubscribe job.
     if (d.getUTCHours() !== 9 || minute !== 0) { try { await unsubCron(env); } catch (e) { await logEvent(env.DB, "unsubscribe_fail", null, `cron: ${e?.message}`); } }
     // Daily reconciliation at 09:00 UTC → my Gmail (a verified destination: free, outside quotas).
-    if (d.getUTCHours() === 9 && minute === 0) { await purgeTrash(env); await purgeEvents(env); await pruneImgQueue(env); await sweepImgs(env).catch((e) => console.log("img sweep", String(e?.message || e))); await trkPrune(env); await gmailMirrorPrune(env); await gmailWatchAll(env); await gmailDailyCheck(env); try { await sweepUnindexedRaw(env, d.getUTCDay() === 0); } catch (e) { await logEvent(env.DB, "sweep_fail", null, e?.message); } try { await reconcileInbound(env, 20); } catch (e) { await logEvent(env.DB, "reconcile_fail", null, e?.message); } await dailyReport(env, results); }
+    if (d.getUTCHours() === 9 && minute === 0) { await purgeTrash(env); await purgeEvents(env); await pruneImgQueue(env); await sweepImgs(env).catch((e) => console.log("img sweep", String(e?.message || e))); await trkPrune(env); await sweepDrops(env).catch((e) => console.log("drop sweep", String(e?.message || e))); await logoDaily(env).catch((e) => console.log("logo daily", String(e?.message || e))); await gmailMirrorPrune(env); await gmailWatchAll(env); await gmailDailyCheck(env); try { await sweepUnindexedRaw(env, d.getUTCDay() === 0); } catch (e) { await logEvent(env.DB, "sweep_fail", null, e?.message); } try { await reconcileInbound(env, 20); } catch (e) { await logEvent(env.DB, "reconcile_fail", null, e?.message); } await dailyReport(env, results); }
     // A row that failed RECONCILE_TRIES times: one an hour, last, so a mail that cannot be projected costs only itself.
     if (minute === 30) { try { await reconcileInbound(env, 1, { stuck: true }); } catch (e) { await logEvent(env.DB, "reconcile_fail", null, `stuck: ${e?.message}`); } }
   }); },
@@ -7397,6 +7827,7 @@ export default {
       if (url.pathname === "/manifest.webmanifest") return stat(MANIFEST, "application/manifest+json");
       if (url.pathname === "/api/version") return json({ version: v });
     }
+    if (url.pathname.startsWith("/f/")) { const r = await dropPublic(request, env, url); if (r) return r; }   // a large file's link: public, by its token
     if ((url.pathname === "/privacy" || url.pathname === "/terms") && request.method === "GET") return new Response(PRIVACY_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=3600" } });
     // ---- The Windows app's installer and its updates ----
     // Outside the session gate on purpose: the app's updater asks before anyone is signed in, and an installer for a shell that

@@ -43,6 +43,18 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## resvg (img/src/logomark.js, the npm package @resvg/resvg-wasm 2.6.2)
+
+The logo fingerprint draws SVG, PNG, JPEG and GIF logos with resvg, compiled to WebAssembly by the resvg-js project
+(github.com/yisibl/resvg-js) and installed from npm as @resvg/resvg-wasm, unmodified. It is licensed under the Mozilla Public License 2.0
+(mozilla.org/MPL/2.0/); its source is available from that repository.
+
+## Tranco (fetched at run time, not included here)
+
+The hub downloads the Tranco list of top sites (tranco-list.eu) every 30 days and keeps its first 10,000 domains in its own storage, to
+protect those brands' names and logos. No list content is part of this repository. Tranco: Le Pochat et al., "Tranco: A Research-Oriented
+Top Sites Ranking Hardened Against Manipulation", NDSS 2019.
+
 ## EasyList and EasyPrivacy (fetched at run time, not included here)
 
 The hub downloads EasyList and EasyPrivacy each day from easylist.to and keeps the copies in its own storage. No list content is part of
@@ -52,7 +64,8 @@ Commons Attribution-ShareAlike 3.0 (easylist.to/pages/licence.html).
 ## The picture shrinker (img/wasm/shrink.wasm)
 
 The WebAssembly module is compiled from `img/wasm/shrink.c` and five libraries, fetched and checked by `img/wasm/build.sh`:
-libjpeg-turbo 3.2.1, libspng 0.7.4, zlib 1.3.1, giflib 6.1.3 and libwebp 1.6.0. Their notices:
+libjpeg-turbo 3.2.1, libspng 0.7.4, zlib 1.3.1, giflib 6.1.3 and libwebp 1.6.0. Their notices are below. `img/wasm/logodec.wasm`, the logo
+fingerprint's WebP reader (`img/wasm/build_logodec.sh`), is compiled from `img/wasm/logodec.c` and the same libwebp 1.6.0.
 
 ### libjpeg-turbo (the libjpeg API library, IJG License)
 

@@ -30,6 +30,11 @@ bucket_name = "mailhub-store"
 [[send_email]]
 name = "EMAIL"
 
+# The mailhub-img Worker's logo fingerprint (img/src/logomark.js): a service binding, so that Worker keeps no public URL.
+[[services]]
+binding = "IMGW"
+service = "mailhub-img"
+
 [triggers]
 crons = ["* * * * *"]
 

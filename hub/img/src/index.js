@@ -7,6 +7,7 @@
 // keys of their own, imgv/<sha>-1600 and imgv/<sha>-1080, each kept only when it is under 80 % of the original. Once the desktop size is
 // written the original is deleted (the phone falls back to the desktop size); a picture neither size helps keeps its original.
 import SHRINK_WASM from "../wasm/shrink.wasm";
+import { logoMark } from "./logomark.js";
 
 export const IMG = { widths: [1600, 1080], quality: 82, methodStill: 4, methodAnim: 2, methodLean: 2, keepUnder: 0.8, batch: 12, batchMs: 25_000, staleMs: 10 * 60_000,
   maxTries: 3, maxPx: 20_000_000, maxFrames: 2000, reuse: 25, maxBytes: 16 * 1024 * 1024 };
@@ -141,7 +142,15 @@ export async function tick(env) {
 }
 
 export default {
-  fetch() { return new Response("not found", { status: 404 }); },
+  // The hub's only way in (a service binding; this Worker has no public URL): a logo's fingerprint (logomark.js).
+  async fetch(request) {
+    const u = new URL(request.url);
+    if (request.method !== "POST" || u.pathname !== "/logo-mark") return new Response("not found", { status: 404 });
+    const b = new Uint8Array(await request.arrayBuffer());
+    if (b.length > 512 * 1024) return Response.json({ error: "too big" }, { status: 413 });
+    try { const m = await logoMark(b); return Response.json(m || { error: "not a picture this reads" }, { status: m ? 200 : 422 }); }
+    catch (e) { return Response.json({ error: String(e?.message || e).slice(0, 160) }, { status: 500 }); }
+  },
   // A failed tick fails the scheduled event, so the Cron Trigger's past events show it (as mailhub-shrink does).
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(tick(env).then((r) => { if (r.n) console.log("img", JSON.stringify(r)); }, (e) => { console.log("img error", String(e?.message || e)); throw e; }));
